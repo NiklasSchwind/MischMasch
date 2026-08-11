@@ -81,6 +81,53 @@ ens = s.sample(gmt, n_members=20, area_weights=region_area_fractions)
 `region_area_fractions` is a length-`n_tas` array summing to 1. Only physically
 meaningful if your `tas` regions tile the globe.
 
+## ACCESS-ESM1-5 driver script
+
+`run_access_esm.py` does the full IIASA run: load the training scenarios via
+`emuvaluate.data_preparation.load_scenarios`, train, then emulate `ssp245`.
+
+```bash
+python run_access_esm.py                       # train + emulate
+python run_access_esm.py --skip-train          # reuse the checkpoint, re-emulate
+python run_access_esm.py --max-steps 50000 --members-per-gmt 10
+```
+
+Writes to `/hdrive/all_users/schwind/MischMasch` (change with `--out-root`):
+
+```
+models/access-esm1-5/last.pt        model + EMA + normaliser + config
+models/access-esm1-5/config.json
+test_data/ssp245_emulated.npy       object array of (117, T) arrays,
+                                    same layout load_scenarios hands out,
+                                    physical units, GMT row preserved
+test_data/ssp245_emulated_tas.npy   (57, T) blocks
+test_data/ssp245_emulated_pr.npy    (59, T) blocks
+test_data/ssp245_reference.npy      the ESM ssp245 members, unmodified
+test_data/metadata.json             which emulated array came from which
+                                    source member, plus seeds and full config
+```
+
+```python
+sims = list(np.load(".../ssp245_emulated.npy", allow_pickle=True))
+```
+
+Three things the script does on purpose:
+
+* **Loads one scenario per `load_scenarios` call.** A single call for all of
+  them would lose the scenario label, and the label is what keeps ensemble
+  members of a scenario on the same side of the train/val split.
+* **Skips scenarios that fail to load** with a warning rather than aborting
+  after an hour of I/O — a few of the `esm-1pct-brch-*` runs may not exist for
+  every model.
+* **Verifies the tas/pr split by magnitude** (`verify_layout`). `tas` is O(10)
+  and `pr` is O(1e-5), so the boundary is visible in the data; if the largest
+  magnitude break is not at row 57 the script says so. Getting `N_TAS` wrong is
+  silent and fatal, so it is worth the check.
+
+Emulated members are generated per source `ssp245` member (each conditioned on
+that member's own GMT, matching how the model was trained),
+`--members-per-gmt` of them each.
+
 ## Evaluate
 
 ```python
