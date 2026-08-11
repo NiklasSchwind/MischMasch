@@ -5,17 +5,24 @@
     python run_access_esm.py --skip-train         # reuse existing checkpoint
     python run_access_esm.py --max-steps 50000    # shorter run
 
+`misch_masch/config.py` is the single source of truth. Every flag below
+defaults to ``None`` and only overrides the corresponding config field when
+you pass it explicitly, so editing config.py is enough -- nothing here
+silently overwrites your settings. The resolved config is printed at startup
+and saved next to the checkpoint.
+
 Outputs
 -------
     <out-root>/models/<run-name>/last.pt        checkpoint (model + EMA +
                                                 normaliser + config: this file
                                                 alone is enough to reload)
     <out-root>/models/<run-name>/config.json
-    <out-root>/test_data/ssp245_emulated.npy    object array of (117, T) arrays
-                                                in the SAME layout emuvaluate
-                                                hands out, physical units
-    <out-root>/test_data/ssp245_emulated_tas.npy   (57, T) blocks
-    <out-root>/test_data/ssp245_emulated_pr.npy    (59, T) blocks
+    <out-root>/test_data/ssp245_emulated.npy    object array of (1+n_tas+n_pr, T)
+                                                arrays in the SAME layout
+                                                emuvaluate hands out, physical
+                                                units
+    <out-root>/test_data/ssp245_emulated_tas.npy   (n_tas, T) blocks
+    <out-root>/test_data/ssp245_emulated_pr.npy    (n_pr, T) blocks
     <out-root>/test_data/ssp245_reference.npy   the ESM ssp245 members, as-is
     <out-root>/test_data/metadata.json          provenance for every array
 
@@ -33,10 +40,12 @@ import time
 from typing import List, Sequence, Tuple
 
 import numpy as np
+import torch
 
 from emuvaluate.data_preparation import load_scenarios
 
 from misch_masch import Config, ScenarioSampler, train_from_sims
+from misch_masch.config import DataConfig, DiffusionConfig, TrainConfig
 
 # --------------------------------------------------------------------------
 
@@ -58,8 +67,8 @@ TRAIN_SCENARIOS = [
 ]
 TEST_SCENARIOS = ["ssp245"]
 
-#: row layout of one simulation: 1 GMT + N_TAS tas + N_PR pr
-N_TAS, N_PR = 57, 59
+# NOTE: the row layout (n_tas / n_pr) is NOT defined here -- it comes from
+# misch_masch/config.py, so there is exactly one place to change it.
 
 
 # --------------------------------------------------------------------------
@@ -103,7 +112,7 @@ def _trim_to_whole_years(a: np.ndarray) -> np.ndarray:
     return a[:, : T - T % 12] if T % 12 else a
 
 
-def load(scenarios: Sequence[str], model: str, model_path: str
+def load(scenarios: Sequence[str], model: str, model_path: str, min_months: int
          ) -> Tuple[List[np.ndarray], List[str]]:
     """Load one scenario at a time, so we know each simulation's group label.
 
@@ -128,46 +137,53 @@ def load(scenarios: Sequence[str], model: str, model_path: str
                 train_pattern_scaling_name=None,
             )
         except Exception as e:                    # noqa: BLE001
-            print(f"[warn] skipping '{sc}': {type(e).__name__}: {e}")
+            print(f"[warn] skipping '{sc}': {type(e).__name__}: {e}", flush=True)
             continue
         arrs = [_trim_to_whole_years(a) for a in _as_array_list(raw)]
-        arrs = [a for a in arrs if a.shape[1] >= 96]
+        dropped = sum(1 for a in arrs if a.shape[1] < min_months)
+        arrs = [a for a in arrs if a.shape[1] >= min_months]
+        if dropped:
+            print(f"[warn] '{sc}': dropped {dropped} member(s) shorter than "
+                  f"the {min_months}-month window", flush=True)
         if not arrs:
-            print(f"[warn] '{sc}' returned no usable simulations")
+            print(f"[warn] '{sc}' returned no usable simulations", flush=True)
             continue
         sims.extend(arrs)
         groups.extend([sc] * len(arrs))
         print(f"[load] {sc:<32s} {len(arrs):>3d} members, "
-              f"T = {sorted({a.shape[1] for a in arrs})}  ({time.time()-t0:.1f}s)")
+              f"T = {sorted({a.shape[1] for a in arrs})}  ({time.time()-t0:.1f}s)",
+              flush=True)
     if not sims:
         raise RuntimeError("no simulations loaded")
     return sims, groups
 
 
-def verify_layout(sims: Sequence[np.ndarray], n_tas: int, n_pr: int) -> None:
-    """Fail loudly if the row layout is not what the model assumes.
+def verify_layout(sims: Sequence[np.ndarray], cfg: Config) -> None:
+    """Fail loudly if the row layout is not what the config assumes.
 
     Also checks the tas/pr split point by magnitude: tas is O(10), pr is
     O(1e-5), so the boundary is visible in the data.  Getting this wrong is
     silent and fatal, so it is worth the ten lines.
     """
+    d = cfg.data
     n_rows = sims[0].shape[0]
-    if n_rows != 1 + n_tas + n_pr:
+    if n_rows != d.n_rows:
         raise ValueError(
-            f"expected {1 + n_tas + n_pr} rows (1 GMT + {n_tas} tas + {n_pr} pr), "
-            f"got {n_rows}. Adjust N_TAS / N_PR at the top of this script."
+            f"expected {d.n_rows} rows (1 GMT + {d.n_tas} tas + {d.n_pr} pr), "
+            f"got {n_rows}. Fix data.n_tas / data.n_pr in misch_masch/config.py."
         )
+    if not all(a.shape[0] == n_rows for a in sims):
+        raise ValueError("simulations have inconsistent row counts")
+
     scale = np.mean([np.abs(a[1:]).mean(axis=1) for a in sims[:5]], axis=0)
     scale = np.maximum(scale, 1e-30)
     drop = int(np.argmax(np.log10(scale[:-1]) - np.log10(scale[1:]))) + 1
-    ratio = scale[:n_tas].mean() / scale[n_tas:].mean()
+    ratio = scale[: d.n_tas].mean() / scale[d.n_tas :].mean()
     print(f"[check] mean|tas| / mean|pr| = {ratio:.3g}")
-    if drop != n_tas:
+    if drop != d.n_tas:
         print(f"[warn] the largest magnitude break is after row {drop}, but "
-              f"N_TAS = {n_tas}. Verify the tas/pr split before trusting "
-              f"anything downstream.")
-    if not all(a.shape[0] == n_rows for a in sims):
-        raise ValueError("simulations have inconsistent row counts")
+              f"data.n_tas = {d.n_tas}. Verify the tas/pr split in config.py "
+              f"before trusting anything downstream.")
 
 
 # --------------------------------------------------------------------------
@@ -183,87 +199,162 @@ def save_object_list(path: str, arrays: Sequence[np.ndarray]) -> None:
 
 
 # --------------------------------------------------------------------------
+# config resolution
+# --------------------------------------------------------------------------
 
 
 def build_config(args) -> Config:
+    """Start from config.py and apply ONLY the flags that were passed."""
     cfg = Config()
-    cfg.data.n_tas, cfg.data.n_pr = N_TAS, N_PR
-    cfg.data.window = args.window
-    cfg.data.january_start = True
-    cfg.data.context_lengths = tuple(range(12, args.window, 12))
-    cfg.data.val_fraction = args.val_fraction
-    cfg.data.seed = args.seed
 
-    cfg.model.d_model = args.d_model
-    cfg.model.depth = args.depth
-    cfg.model.n_heads = args.n_heads
-    cfg.model.gmt_max_years = 2048
+    def setopt(obj, name, value):
+        if value is not None:
+            setattr(obj, name, value)
 
-    cfg.diffusion.sample_steps = args.sample_steps
+    window_overridden = args.window is not None
 
-    cfg.train.device = args.device
-    cfg.train.batch_size = args.batch_size
-    cfg.train.max_steps = args.max_steps
-    cfg.train.lr = args.lr
-    cfg.train.num_workers = args.num_workers
-    cfg.train.amp = not args.no_amp
-    cfg.train.val_every = args.val_every
-    cfg.train.ckpt_every = args.ckpt_every
+    setopt(cfg.data, "window", args.window)
+    setopt(cfg.data, "january_start", args.january_start)
+    setopt(cfg.data, "val_fraction", args.val_fraction)
+    setopt(cfg.data, "seed", args.seed)
+    if window_overridden:
+        # an explicit --window invalidates any hand-written context ladder;
+        # empty means "derive every multiple of 12 up to window - 12"
+        cfg.data.context_lengths = ()
+
+    setopt(cfg.model, "d_model", args.d_model)
+    setopt(cfg.model, "depth", args.depth)
+    setopt(cfg.model, "n_heads", args.n_heads)
+
+    setopt(cfg.diffusion, "sample_steps", args.sample_steps)
+
+    setopt(cfg.train, "device", args.device)
+    setopt(cfg.train, "batch_size", args.batch_size)
+    setopt(cfg.train, "max_steps", args.max_steps)
+    setopt(cfg.train, "lr", args.lr)
+    setopt(cfg.train, "num_workers", args.num_workers)
+    setopt(cfg.train, "val_every", args.val_every)
+    setopt(cfg.train, "ckpt_every", args.ckpt_every)
+    if args.no_amp:
+        cfg.train.amp = False
     cfg.train.out_dir = os.path.join(args.out_root, "models", args.run_name)
-    return cfg
+
+    return cfg.finalize()
+
+
+def check_device(cfg: Config, allow_cpu: bool) -> None:
+    """Report the runtime, and refuse to start a 48-hour CPU run by accident."""
+    avail = torch.cuda.is_available()
+    print(f"[env] torch {torch.__version__}  cuda_available={avail}")
+    if avail:
+        print(f"[env] device: {torch.cuda.get_device_name(0)}  "
+              f"bf16_supported={torch.cuda.is_bf16_supported()}")
+        if cfg.train.amp and not torch.cuda.is_bf16_supported():
+            print("[warn] bf16 autocast is enabled but this GPU does not "
+                  "support bf16 -- pass --no-amp.")
+    if cfg.train.device.startswith("cuda") and not avail:
+        msg = ("train.device is 'cuda' but torch cannot see a GPU. Training "
+               "would silently fall back to CPU and take ~100x longer.")
+        if not allow_cpu:
+            raise SystemExit(f"[fatal] {msg} Pass --allow-cpu to override.")
+        print(f"[warn] {msg} Continuing because --allow-cpu was given.")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    _d, _t, _f = DataConfig(), TrainConfig(), DiffusionConfig()
+
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default=MODEL)
     p.add_argument("--model-path", default=None,
                    help="default: /projects/icigroup/CMIP6/cmip6-ng-inc-oceans/<model>")
     p.add_argument("--out-root", default="/hdrive/all_users/schwind/MischMasch")
     p.add_argument("--run-name", default="access-esm1-5")
 
-    p.add_argument("--max-steps", type=int, default=150_000)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--window", type=int, default=96)
-    p.add_argument("--d-model", type=int, default=256)
-    p.add_argument("--depth", type=int, default=6)
-    p.add_argument("--n-heads", type=int, default=8)
-    p.add_argument("--val-fraction", type=float, default=0.15)
-    p.add_argument("--val-every", type=int, default=2_000)
-    p.add_argument("--ckpt-every", type=int, default=5_000)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--seed", type=int, default=0)
+    g = p.add_argument_group(
+        "config overrides",
+        "all default to the value in misch_masch/config.py and are only "
+        "applied when passed explicitly")
+    g.add_argument("--max-steps", type=int, default=None,
+                   help=f"config: {_t.max_steps}")
+    g.add_argument("--batch-size", type=int, default=None,
+                   help=f"config: {_t.batch_size}")
+    g.add_argument("--lr", type=float, default=None, help=f"config: {_t.lr:g}")
+    g.add_argument("--window", type=int, default=None,
+                   help=f"config: {_d.window} (an explicit value also "
+                        f"regenerates context_lengths)")
+    g.add_argument("--january-start", dest="january_start", default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help=f"config: {_d.january_start}")
+    g.add_argument("--d-model", type=int, default=None, help="config: see config.py")
+    g.add_argument("--depth", type=int, default=None, help="config: see config.py")
+    g.add_argument("--n-heads", type=int, default=None, help="config: see config.py")
+    g.add_argument("--val-fraction", type=float, default=None,
+                   help=f"config: {_d.val_fraction}")
+    g.add_argument("--val-every", type=int, default=None, help=f"config: {_t.val_every}")
+    g.add_argument("--ckpt-every", type=int, default=None, help=f"config: {_t.ckpt_every}")
+    g.add_argument("--num-workers", type=int, default=None,
+                   help=f"config: {_t.num_workers}")
+    g.add_argument("--device", default=None, help=f"config: {_t.device}")
+    g.add_argument("--seed", type=int, default=None, help=f"config: {_d.seed}")
+    g.add_argument("--sample-steps", type=int, default=None,
+                   help=f"config: {_f.sample_steps}")
+    g.add_argument("--no-amp", action="store_true",
+                   help="disable bf16 autocast (required on pre-Ampere GPUs)")
 
-    p.add_argument("--skip-train", action="store_true",
+    r = p.add_argument_group("run options")
+    r.add_argument("--skip-train", action="store_true",
                    help="reuse the existing checkpoint and only emulate")
-    p.add_argument("--members-per-gmt", type=int, default=5,
+    r.add_argument("--allow-cpu", action="store_true",
+                   help="do not abort when device is cuda but no GPU is visible")
+    r.add_argument("--members-per-gmt", type=int, default=5,
                    help="emulated members generated per ssp245 GMT trajectory")
-    p.add_argument("--sample-steps", type=int, default=100)
-    p.add_argument("--stride", type=int, default=60)
-    p.add_argument("--no-ema", action="store_true")
+    r.add_argument("--stride", type=int, default=None,
+                   help="window stride in months (default: window // 2, "
+                        "i.e. 50%% overlap)")
+    r.add_argument("--no-ema", action="store_true",
+                   help="sample from the raw weights instead of the EMA")
     args = p.parse_args()
 
+    cfg = build_config(args)
     model_path = args.model_path or f"/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{args.model}"
-    model_dir = os.path.join(args.out_root, "models", args.run_name)
+    model_dir = cfg.train.out_dir
     test_dir = os.path.join(args.out_root, "test_data")
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     ckpt = os.path.join(model_dir, "last.pt")
 
-    cfg = build_config(args)
+    # stride / overlap
+    stride = args.stride if args.stride is not None else cfg.data.window // 2
+    overlap = cfg.data.window - stride
+    if stride <= 0 or stride > cfg.data.window - 12:
+        raise SystemExit(f"[fatal] --stride must be in [12, {cfg.data.window - 12}]")
+    if cfg.data.january_start and stride % 12:
+        raise SystemExit("[fatal] --stride must be a multiple of 12 when "
+                         "data.january_start is True")
+
+    print("\n=== configuration " + "=" * 44)
+    check_device(cfg, args.allow_cpu)
+    print(cfg.summary())
+    print(f"  inference   : stride {stride}, overlap {overlap} months")
+    if overlap not in cfg.data.context_lengths:
+        print(f"[warn] the inference overlap ({overlap}) is not in "
+              f"data.context_lengths -- the model will be asked for a context "
+              f"length it never saw. Expect seams.")
 
     # ---------------------------------------------------------------- train
     if not args.skip_train:
         print("\n=== loading training scenarios " + "=" * 32)
-        sims, groups = load(TRAIN_SCENARIOS, args.model, model_path)
-        verify_layout(sims, N_TAS, N_PR)
+        sims, groups = load(TRAIN_SCENARIOS, args.model, model_path, cfg.data.window)
+        verify_layout(sims, cfg)
         n_months = sum(a.shape[1] for a in sims)
+        n_eff = n_months // cfg.data.window
         print(f"[load] {len(sims)} simulations, {n_months} months total, "
-              f"~{n_months // cfg.data.window} effective independent windows")
-        if n_months // cfg.data.window < 5_000:
+              f"~{n_eff} effective independent windows")
+        if n_eff < 5_000:
             print("[note] that is a small effective sample count -- consider "
                   "--d-model 192 --depth 4, and watch the validation loss.")
 
@@ -272,18 +363,26 @@ def main() -> None:
         del sims
     else:
         if not os.path.exists(ckpt):
-            raise FileNotFoundError(f"--skip-train given but {ckpt} does not exist")
-        print(f"[skip-train] reusing {ckpt}")
+            raise SystemExit(f"[fatal] --skip-train given but {ckpt} does not exist")
+        print(f"\n[skip-train] reusing {ckpt}")
 
     # ----------------------------------------------------------- emulate
     print("\n=== loading test scenario " + "=" * 36)
-    test_sims, test_groups = load(TEST_SCENARIOS, args.model, model_path)
-    verify_layout(test_sims, N_TAS, N_PR)
+    test_sims, test_groups = load(TEST_SCENARIOS, args.model, model_path,
+                                  cfg.data.window)
+    verify_layout(test_sims, cfg)
 
     print("\n=== emulating " + "=" * 48)
     sampler = ScenarioSampler.from_checkpoint(
-        ckpt, device=args.device, use_ema=not args.no_ema
+        ckpt, device=cfg.train.device, use_ema=not args.no_ema
     )
+    # the checkpoint's own config governs the row layout of what comes out
+    n_tas = sampler.cfg.data.n_tas
+    n_pr = sampler.cfg.data.n_pr
+    if (n_tas, n_pr) != (cfg.data.n_tas, cfg.data.n_pr):
+        print(f"[warn] checkpoint was trained with n_tas={n_tas}, n_pr={n_pr}, "
+              f"but config.py now says {cfg.data.n_tas}/{cfg.data.n_pr}. "
+              f"Using the checkpoint's layout.")
 
     emulated: List[np.ndarray] = []
     meta: List[dict] = []
@@ -292,16 +391,17 @@ def main() -> None:
         gmt = np.asarray(sim[0], dtype=np.float64)
         T = gmt.size
         print(f"[emulate] source member {i + 1}/{len(test_sims)} "
-              f"({T} months, {T // 12} years) x {args.members_per_gmt} members")
+              f"({T} months, {T // 12} years) x {args.members_per_gmt} members",
+              flush=True)
         ens = sampler.sample(
             gmt,
             n_members=args.members_per_gmt,
-            stride=args.stride,
-            steps=args.sample_steps,
-            seed=args.seed * 1000 + i,
+            stride=stride,
+            steps=cfg.diffusion.sample_steps,
+            seed=cfg.data.seed * 1000 + i,
         )
         for m in range(ens.shape[0]):
-            arr = np.empty((1 + N_TAS + N_PR, T), dtype=np.float32)
+            arr = np.empty((1 + n_tas + n_pr, T), dtype=np.float32)
             arr[0] = gmt                       # keep the GMT row: same layout in
             arr[1:] = ens[m]                   # and out, so emuvaluate can read it
             emulated.append(arr)
@@ -311,7 +411,7 @@ def main() -> None:
                 source_member=i,
                 emulated_member=m,
                 n_months=int(T),
-                seed=args.seed * 1000 + i,
+                seed=cfg.data.seed * 1000 + i,
             ))
     print(f"[emulate] {len(emulated)} arrays in {time.time() - t0:.1f}s")
 
@@ -319,9 +419,9 @@ def main() -> None:
     tag = "_".join(TEST_SCENARIOS)
     save_object_list(os.path.join(test_dir, f"{tag}_emulated.npy"), emulated)
     save_object_list(os.path.join(test_dir, f"{tag}_emulated_tas.npy"),
-                     [a[1 : 1 + N_TAS] for a in emulated])
+                     [a[1 : 1 + n_tas] for a in emulated])
     save_object_list(os.path.join(test_dir, f"{tag}_emulated_pr.npy"),
-                     [a[1 + N_TAS :] for a in emulated])
+                     [a[1 + n_tas :] for a in emulated])
     save_object_list(os.path.join(test_dir, f"{tag}_reference.npy"), test_sims)
 
     with open(os.path.join(test_dir, "metadata.json"), "w") as f:
@@ -332,14 +432,15 @@ def main() -> None:
             test_scenarios=TEST_SCENARIOS,
             checkpoint=ckpt,
             used_ema=not args.no_ema,
-            sample_steps=args.sample_steps,
-            stride=args.stride,
+            sample_steps=cfg.diffusion.sample_steps,
+            stride=stride,
+            overlap=overlap,
             members_per_gmt=args.members_per_gmt,
-            row_layout=dict(gmt=[0, 1], tas=[1, 1 + N_TAS],
-                            pr=[1 + N_TAS, 1 + N_TAS + N_PR]),
+            row_layout=dict(gmt=[0, 1], tas=[1, 1 + n_tas],
+                            pr=[1 + n_tas, 1 + n_tas + n_pr]),
             units="physical, identical to the load_scenarios output",
             arrays=meta,
-            config=cfg.to_dict(),
+            config=sampler.cfg.to_dict(),
         ), f, indent=2)
 
     print(f"\n[done] checkpoint  -> {ckpt}")

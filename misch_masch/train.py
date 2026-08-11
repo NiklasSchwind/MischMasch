@@ -99,7 +99,7 @@ def train_from_sims(
     esm_ids : one integer per simulation if you train on several ESMs; also set
               ``cfg.model.n_esm``.
     """
-    cfg = cfg or Config()
+    cfg = (cfg or Config()).finalize()
     device = torch.device(cfg.train.device if torch.cuda.is_available()
                           or cfg.train.device == "cpu" else "cpu")
 

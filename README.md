@@ -6,8 +6,8 @@ time series from a global-mean-temperature (GMT) trajectory.
 * **Denoiser:** 1-D DiT (transformer, adaLN-Zero conditioning) over month tokens
 * **Conditioning:** causal transformer over the *full* annual GMT history plus
   explicit path-dependence features
-* **Long scenarios:** context-conditioned outpainting — 96-month windows,
-  60-month stride, 36-month clean prefix
+* **Long scenarios:** context-conditioned outpainting — 240-month windows,
+  120-month stride, 120-month clean prefix (all set in `config.py`)
 * **Probabilistic:** ensemble members differ by initial noise + ancestral
   sampling; no classifier-free guidance (deliberately)
 
@@ -19,6 +19,15 @@ time series from a global-mean-temperature (GMT) trajectory.
 pip install torch numpy
 ```
 
+`misch_masch/config.py` is the **single source of truth**. Every flag in
+`run_access_esm.py` defaults to `None` and only overrides its config field when
+passed explicitly, so editing the defaults in `config.py` is enough. `Config`
+validates itself on construction and again via `finalize()` after mutation, so
+inconsistent settings (window not a multiple of 12, window past `max_window`,
+`d_model` not divisible by `n_heads`, a context ladder that no longer fits the
+window) fail at startup instead of hours in. Leave `data.context_lengths`
+empty to derive every multiple of 12 up to `window - 12`.
+
 ## Data format
 
 A `list` of numpy arrays, one per simulation, each `(117, T)` with `T % 12 == 0`
@@ -27,11 +36,12 @@ and column 0 = January:
 | rows      | contents                                             |
 |-----------|------------------------------------------------------|
 | `0`       | GMT — annual value repeated 12× within each year     |
-| `1..57`   | monthly regional `tas` (57 IPCC regions)             |
-| `58..116` | monthly regional `pr` (59 IPCC regions)              |
+| `1..58`   | monthly regional `tas` (58 IPCC regions)             |
+| `59..116` | monthly regional `pr` (58 IPCC regions)              |
 
-Lengths may differ between simulations. Set `cfg.data.n_tas` / `n_pr` if your
-region counts differ.
+Lengths may differ between simulations. `data.n_tas` / `data.n_pr` in
+`misch_masch/config.py` define the split and are the only place it is written
+down; `run_access_esm.py` reads them from there.
 
 ## Train
 
@@ -100,8 +110,8 @@ models/access-esm1-5/config.json
 test_data/ssp245_emulated.npy       object array of (117, T) arrays,
                                     same layout load_scenarios hands out,
                                     physical units, GMT row preserved
-test_data/ssp245_emulated_tas.npy   (57, T) blocks
-test_data/ssp245_emulated_pr.npy    (59, T) blocks
+test_data/ssp245_emulated_tas.npy   (n_tas, T) blocks
+test_data/ssp245_emulated_pr.npy    (n_pr, T) blocks
 test_data/ssp245_reference.npy      the ESM ssp245 members, unmodified
 test_data/metadata.json             which emulated array came from which
                                     source member, plus seeds and full config
@@ -121,8 +131,11 @@ Three things the script does on purpose:
   every model.
 * **Verifies the tas/pr split by magnitude** (`verify_layout`). `tas` is O(10)
   and `pr` is O(1e-5), so the boundary is visible in the data; if the largest
-  magnitude break is not at row 57 the script says so. Getting `N_TAS` wrong is
-  silent and fatal, so it is worth the check.
+  magnitude break is not at `data.n_tas` the script says so. Getting that wrong
+  is silent and fatal, so it is worth the check.
+* **Aborts if `train.device` is `cuda` but torch cannot see a GPU**, rather than
+  falling back to CPU and burning a 48-hour allocation at 1/100 speed. Override
+  with `--allow-cpu`.
 
 Emulated members are generated per source `ssp245` member (each conditioned on
 that member's own GMT, matching how the model was trained),
@@ -132,7 +145,7 @@ that member's own GMT, matching how the model was trained),
 
 ```python
 from misch_masch import evaluate
-evaluate.report(ens, ref_ensemble, n_tas=57, gmt_monthly=gmt)
+evaluate.report(ens, ref_ensemble, n_tas=cfg.data.n_tas, gmt_monthly=gmt)
 ```
 
 where `ref_ensemble` is `(M, 116, T)` of held-out ESM members for the same
@@ -152,7 +165,7 @@ python smoke_test.py    # ~3 min on CPU, synthetic data, proves the pipeline run
 
 Raw `tas` is O(10); raw `pr` is O(1e-5). Under an MSE denoising loss the `pr`
 channels contribute ~1e-12 of the gradient — you would train a `tas`-only model
-with 59 dead channels. `check_data` prints the magnitude ratio so this is
+with 58 dead channels. `check_data` prints the magnitude ratio so this is
 impossible to miss. Standardising per *calendar month* additionally removes the
 climatological seasonal cycle, so capacity goes to anomalies instead of
 re-learning summer and winter.
@@ -169,7 +182,7 @@ impose a spurious locality prior, mixing (say) Central Africa with Northern
 Europe because they happen to be adjacent in the row index. So: one token per
 month, with the full 116-vector as the token's channel dimension. Cross-region
 structure comes from the embedding matrix and the residual stream (no false
-locality), cross-time structure from full self-attention over 96 tokens.
+locality), cross-time structure from full self-attention over the window's month tokens.
 
 ### GMT is annual
 
@@ -242,11 +255,11 @@ heavily. `train_from_sims` prints this. Below ~1e4, keep `d_model`/`depth` small
 (defaults give ~5 M parameters) and check `evaluate.nearest_neighbour_distance`
 for memorisation.
 
-**4. January-only crops cost a factor of 12 in training data.** You asked for
-this and it is the default. If data turns out to be the binding constraint, set
-`cfg.data.january_start = False`: crops then start at any month, and the
-per-token calendar-month embedding (already in the model) keeps the seasonal
-cycle learnable. Everything else works unchanged.
+**4. Crop alignment.** `data.january_start = False` (the default) lets crops
+start at any month, giving 12x the crops as seasonal-phase augmentation; the
+per-token calendar-month embedding keeps the seasonal cycle learnable. Set it
+to `True` for strictly January-aligned crops. Note that neither setting changes
+the number of *effective independent* windows, which is `sum(T) / window`.
 
 **5. Physical constraints are not enforced.** Generated `pr` anomalies can fall
 below `-climatology`, i.e. imply negative total precipitation. Check how often,

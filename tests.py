@@ -74,6 +74,35 @@ def test_config_roundtrip():
     print("  config JSON roundtrip OK")
 
 
+def test_config_validation_and_normalisation():
+    from misch_masch.config import DataConfig
+    # empty context_lengths derives the full ladder from the window
+    d = DataConfig(window=96, context_lengths=())
+    assert d.context_lengths == tuple(range(12, 96, 12)), d.context_lengths
+    # entries longer than window - 12 are dropped, and finalize() re-runs
+    # normalisation after a mutation
+    cfg = tiny_cfg()
+    cfg.data.window = 96
+    cfg.finalize()
+    assert max(cfg.data.context_lengths) <= 84, cfg.data.context_lengths
+    # cross-field checks fire instead of failing later at runtime
+    for mutate, msg in [
+        (lambda c: setattr(c.data, "window", 4092), "max_window"),
+        (lambda c: setattr(c.model, "n_heads", 7), "divisible"),
+        (lambda c: setattr(c.data, "window", 100), "multiple of 12"),
+        (lambda c: setattr(c.data, "pr_transform", "sqrt"), "pr_transform"),
+    ]:
+        c = tiny_cfg()
+        mutate(c)
+        try:
+            c.finalize()
+        except ValueError as e:
+            assert msg in str(e), (msg, str(e))
+        else:
+            raise AssertionError(f"expected a ValueError mentioning {msg!r}")
+    print("  config validation + context-ladder derivation OK")
+
+
 def test_group_split_no_leak():
     groups = ["a", "a", "b", "b", "c", "c", "d", "d"]
     tr, va = group_split(8, groups, 0.25, seed=0)
@@ -101,7 +130,7 @@ def test_dataset_context_masking():
 
 
 def test_january_alignment():
-    cfg = tiny_cfg()
+    cfg = tiny_cfg(**{"data.january_start": True})
     sims = [make_sim()]
     nrm = Normalizer.fit(sims, cfg.data)
     ds = CropDataset(sims, nrm, cfg, train=False)

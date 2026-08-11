@@ -1,7 +1,12 @@
 """Configuration objects for MISCH-MASCH.
 
-Everything that changes behaviour lives here so experiments are reproducible
-from a single JSON file.
+This file is the single source of truth. Everything that changes behaviour
+lives here, and `run_access_esm.py` only overrides a field when you pass the
+corresponding flag explicitly -- editing the defaults below is enough.
+
+`Config` validates itself on construction, and again via `finalize()` after
+any programmatic mutation, so mismatched settings fail loudly at startup
+instead of silently misbehaving twelve hours into a job.
 """
 
 from __future__ import annotations
@@ -9,6 +14,8 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Tuple
+
+PR_TRANSFORMS = ("none", "signed_cbrt")
 
 
 @dataclass
@@ -21,8 +28,10 @@ class DataConfig:
     start_month: int = 0
 
     # ---- cropping ----
-    window: int = 240  # months per generated piece
+    window: int = 240  # months per generated piece (must be a multiple of 12)
     #: if True, crops start at X with X % 12 == 0 (i.e. always January).
+    #: False gives 12x the crops as seasonal-phase augmentation; the model
+    #: carries a per-token calendar-month embedding either way.
     january_start: bool = False
 
     # ---- preprocessing ----
@@ -33,10 +42,11 @@ class DataConfig:
 
     # ---- context-conditioned outpainting (training-time masking) ----
     #: possible lengths (in months) of the clean prefix handed to the model.
-    #: MUST include the inference overlap (window - stride).  The default
-    #: covers every multiple of 12 up to window - 12, which also keeps the
-    #: final (snapped) window of a scenario in-distribution.
-    context_lengths: Tuple[int, ...] = (12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132,144,156,168,180,192,204,216,228)
+    #: MUST include the inference overlap (window - stride).
+    #: Leave EMPTY to derive every multiple of 12 up to window - 12, which is
+    #: what you want unless you are deliberately concentrating training on one
+    #: overlap length.  Entries longer than window - 12 are dropped.
+    context_lengths: Tuple[int, ...] = ()
     #: probability of a fully unconditional window (needed for the very first
     #: window of a scenario, which has no history to condition on).
     p_no_context: float = 0.20
@@ -45,6 +55,31 @@ class DataConfig:
     val_fraction: float = 0.15
     seed: int = 0
 
+    def __post_init__(self) -> None:
+        self.normalize()
+
+    def normalize(self) -> None:
+        """Coerce and range-check the fields that can be set inconsistently."""
+        if self.window % 12 != 0:
+            raise ValueError(f"data.window must be a multiple of 12, got {self.window}")
+        if self.window < 24:
+            raise ValueError(f"data.window must be >= 24, got {self.window}")
+        if self.pr_transform not in PR_TRANSFORMS:
+            raise ValueError(
+                f"data.pr_transform must be one of {PR_TRANSFORMS}, "
+                f"got {self.pr_transform!r}"
+            )
+        if not 0.0 <= self.p_no_context <= 1.0:
+            raise ValueError(f"data.p_no_context must be in [0, 1], got {self.p_no_context}")
+        if not 0.0 <= self.val_fraction < 1.0:
+            raise ValueError(f"data.val_fraction must be in [0, 1), got {self.val_fraction}")
+
+        cl = sorted({int(c) for c in self.context_lengths})
+        cl = [c for c in cl if 0 < c <= self.window - 12]
+        if not cl:
+            cl = list(range(12, self.window, 12))
+        self.context_lengths = tuple(cl)
+
     @property
     def n_channels(self) -> int:
         return self.n_tas + self.n_pr
@@ -52,6 +87,10 @@ class DataConfig:
     @property
     def n_rows(self) -> int:
         return 1 + self.n_channels
+
+    @property
+    def max_context(self) -> int:
+        return self.context_lengths[-1]
 
 
 @dataclass
@@ -68,7 +107,7 @@ class ModelConfig:
     gmt_d_model: int = 128
     gmt_depth: int = 4
     gmt_heads: int = 4
-    gmt_max_years: int = 1024
+    gmt_max_years: int = 2048
     #: append elapsed-years as an explicit feature.  Helps with historical
     #: forcings that GMT alone does not explain (volcanoes, aerosols) but
     #: makes the model slightly more "calendar aware" and less purely
@@ -124,6 +163,56 @@ class Config:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
+    def __post_init__(self) -> None:
+        self.finalize()
+
+    def finalize(self) -> "Config":
+        """Re-validate after mutation.  Call this before using a Config you
+        built by assigning to fields (``run_access_esm.py`` does)."""
+        self.data.normalize()
+        m, d = self.model, self.data
+        if d.window > m.max_window:
+            raise ValueError(
+                f"data.window ({d.window}) exceeds model.max_window "
+                f"({m.max_window}); raise max_window (the positional table) "
+                f"or shorten the window."
+            )
+        if m.d_model % m.n_heads:
+            raise ValueError(
+                f"model.d_model ({m.d_model}) must be divisible by "
+                f"model.n_heads ({m.n_heads})"
+            )
+        if m.gmt_d_model % m.gmt_heads:
+            raise ValueError(
+                f"model.gmt_d_model ({m.gmt_d_model}) must be divisible by "
+                f"model.gmt_heads ({m.gmt_heads})"
+            )
+        if m.n_esm < 1:
+            raise ValueError(f"model.n_esm must be >= 1, got {m.n_esm}")
+        if self.diffusion.schedule not in ("cosine", "linear"):
+            raise ValueError(f"diffusion.schedule: {self.diffusion.schedule!r}")
+        return self
+
+    # -- reporting ---------------------------------------------------------
+    def summary(self) -> str:
+        d, m, t = self.data, self.model, self.train
+        cl = self.data.context_lengths
+        return "\n".join([
+            f"  rows        : 1 GMT + {d.n_tas} tas + {d.n_pr} pr = {d.n_rows}",
+            f"  window      : {d.window} months ({d.window // 12} yr), "
+            f"january_start={d.january_start}",
+            f"  context     : {cl[0]}..{cl[-1]} step 12 ({len(cl)} lengths), "
+            f"p_no_context={d.p_no_context}",
+            f"  pr transform: {d.pr_transform}",
+            f"  denoiser    : d_model={m.d_model} depth={m.depth} heads={m.n_heads}",
+            f"  gmt encoder : d_model={m.gmt_d_model} depth={m.gmt_depth} "
+            f"max_years={m.gmt_max_years}",
+            f"  training    : {t.max_steps} steps, batch {t.batch_size}, lr {t.lr:g}, "
+            f"amp={t.amp}, device={t.device}",
+            f"  out_dir     : {t.out_dir}",
+        ])
+
+    # -- (de)serialisation -------------------------------------------------
     def to_dict(self) -> dict:
         return asdict(self)
 
