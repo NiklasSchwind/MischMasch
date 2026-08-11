@@ -15,15 +15,15 @@ from typing import Tuple
 class DataConfig:
     # ---- layout of one simulation array, shape (1 + n_tas + n_pr, T) ----
     gmt_row: int = 0
-    n_tas: int = 57
-    n_pr: int = 59
+    n_tas: int = 58
+    n_pr: int = 58
     #: calendar month of column 0 of every simulation (0 = January)
     start_month: int = 0
 
     # ---- cropping ----
-    window: int = 96  # months per generated piece
+    window: int = 240  # months per generated piece
     #: if True, crops start at X with X % 12 == 0 (i.e. always January).
-    january_start: bool = True
+    january_start: bool = False
 
     # ---- preprocessing ----
     #: "none" | "signed_cbrt".  Precipitation anomalies are heavy-tailed and
@@ -36,7 +36,7 @@ class DataConfig:
     #: MUST include the inference overlap (window - stride).  The default
     #: covers every multiple of 12 up to window - 12, which also keeps the
     #: final (snapped) window of a scenario in-distribution.
-    context_lengths: Tuple[int, ...] = (12, 24, 36, 48, 60, 72, 84)
+    context_lengths: Tuple[int, ...] = (12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132,144,156,168,180,192,204,216,228)
     #: probability of a fully unconditional window (needed for the very first
     #: window of a scenario, which has no history to condition on).
     p_no_context: float = 0.20
