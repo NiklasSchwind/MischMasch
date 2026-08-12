@@ -105,7 +105,10 @@ python run_access_esm.py --max-steps 50000 --members-per-gmt 10
 Writes to `/hdrive/all_users/schwind/MischMasch` (change with `--out-root`):
 
 ```
-models/access-esm1-5/last.pt        model + EMA + normaliser + config
+models/access-esm1-5/best.pt        lowest-validation-loss checkpoint
+                                    (model + EMA + normaliser + config)
+                                    -- this is what inference uses
+models/access-esm1-5/last.pt        final step, for inspection
 models/access-esm1-5/config.json
 test_data/ssp245_emulated.npy       object array of (117, T) arrays,
                                     same layout load_scenarios hands out,
@@ -136,10 +139,57 @@ Three things the script does on purpose:
 * **Aborts if `train.device` is `cuda` but torch cannot see a GPU**, rather than
   falling back to CPU and burning a 48-hour allocation at 1/100 speed. Override
   with `--allow-cpu`.
+* **Emulates from `best.pt`**, not the final step. `--use-last` or
+  `--checkpoint PATH` to override.
 
 Emulated members are generated per source `ssp245` member (each conditioned on
 that member's own GMT, matching how the model was trained),
 `--members-per-gmt` of them each.
+
+## Checkpoint selection and overfitting guards
+
+The first full ACCESS-ESM1-5 run is why these exist. Validation loss bottomed at
+**0.5099 at step 18k of 200k**, drifted up to 0.55 by 166k, then jumped
+discontinuously to 0.80 at ~168k and stayed there — a training collapse, not
+overfitting. The final model was worse than the model at step 2000, and because
+only `last.pt` was written, the good one was gone.
+
+So the loop now:
+
+| setting | default | what it does |
+|---|---|---|
+| `train.save_best` | `True` | writes `best.pt` on every validation improvement |
+| `train.early_stop_patience` | `12` | stops after 12 validations with no improvement (0 disables) |
+| `train.spike_abort_ratio` | `1.25` | aborts if val exceeds the best by 25% — catches a collapse instead of training through it |
+| `train.skip_nonfinite_grads` | `True` | drops an update whose gradient norm is not finite rather than letting one batch move the weights somewhere unrecoverable |
+| `train.val_batches` | `40` | a **fixed random subset spread across all validation sims and start months** — iterating the first N batches in index order only ever saw the earliest months of the first validation run |
+
+And in the model, `model.qk_norm = True` normalises q and k to unit RMS before
+the attention dot product. The collapse was not a bad gradient — training loss
+ramped 0.4609 → 0.8333 over ~1300 steps with finite gradients and a smoothly
+decaying LR, then plateaued with train ≈ val, which is the signature of
+attention entropy collapse (QK logits grow, softmax saturates toward one-hot,
+gradients through attention vanish). QK-norm bounds the logits at ~√head\_dim
+however large the projections grow: at 100× input scale the measured max logit
+is 3.2 with it and 17,781 without. Costs two parameter vectors per attention
+layer and no measurable time. Checkpoints are not interchangeable between
+settings; ones saved before this existed load as `qk_norm=False` automatically.
+
+Checkpoints are written atomically (`.tmp` then `os.replace`), so a killed job
+never leaves a truncated file. The step log now also prints gradient-norm mean
+and max, which is what you would look at first to diagnose a collapse.
+
+If `best_step` lands in the first half of the run, the loop says so and suggests
+a shorter `max_steps`.
+
+## Reference point for the loss
+
+The data is standardised to unit variance, so with v-prediction
+`E[v²] = ᾱ + (1−ᾱ) = 1` exactly. **A model that outputs zero scores 1.0000.**
+Read every loss against that: 0.82 means 18% of the v-variance explained, 0.51
+means 49%. Precipitation is close to white noise after deseasonalising, so with
+half your channels being `pr` the achievable floor is well above zero — the
+absolute number matters far less than the diagnostics below.
 
 ## Evaluate
 
@@ -249,11 +299,14 @@ defence, but verify with `evaluate.trend_drift` before trusting a long run. If
 drift appears: increase overlap (reduce `stride`), or enable the `area_weights`
 GMT projection.
 
-**3. Data volume.** With 8-year windows the number of *effective* independent
-samples is roughly `sum(T) / window`, not the number of crops — crops overlap
-heavily. `train_from_sims` prints this. Below ~1e4, keep `d_model`/`depth` small
-(defaults give ~5 M parameters) and check `evaluate.nearest_neighbour_distance`
-for memorisation.
+**3. Data volume — this one bit.** The number of *effective* independent samples
+is roughly `sum(T) / window`, not the number of crops; crops overlap heavily.
+`train_from_sims` prints it. On ACCESS-ESM1-5 with a 240-month window that was
+small enough that a 256/6 model (8.9 M params) overfit by step 18k of 200k.
+The defaults are now 192/4 with `dropout 0.1` and `weight_decay 0.01`, and
+`max_steps` is 25k rather than 200k. Since an overfit *generative* model
+memorises training windows, `evaluate.nearest_neighbour_distance` is not
+optional here.
 
 **4. Crop alignment.** `data.january_start = False` (the default) lets crops
 start at any month, giving 12x the crops as seasonal-phase augmentation; the

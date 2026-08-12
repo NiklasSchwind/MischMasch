@@ -96,12 +96,24 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     # ---- denoiser (1-D DiT over month tokens) ----
-    d_model: int = 256
-    depth: int = 6
+    #: sized down from 256/6 after the first ACCESS-ESM1-5 run overfit: the
+    #: validation loss bottomed at step 18k of 200k. With ~sum(T)/window
+    #: effective independent samples, capacity is the binding constraint, not
+    #: optimisation.
+    d_model: int = 192
+    depth: int = 4
     n_heads: int = 8
     mlp_ratio: float = 4.0
-    dropout: float = 0.0
+    dropout: float = 0.1
     max_window: int = 256  # capacity of the learned positional table
+    #: normalise q and k to unit RMS before the attention dot product. This
+    #: bounds the logits at ~sqrt(head_dim) however large the projections grow,
+    #: which prevents attention entropy collapse -- the failure that ended the
+    #: first 200k-step run (loss ramped 0.46 -> 0.83 over ~1300 steps at step
+    #: ~166k, finite gradients throughout, no recovery). Costs nothing.
+    #: NOTE: changing this changes the state dict; checkpoints are not
+    #: interchangeable between settings.
+    qk_norm: bool = True
 
     # ---- GMT history encoder ----
     gmt_d_model: int = 128
@@ -138,19 +150,44 @@ class DiffusionConfig:
 class TrainConfig:
     batch_size: int = 64
     lr: float = 2e-4
-    weight_decay: float = 0.0
+    weight_decay: float = 0.01
     betas: Tuple[float, float] = (0.9, 0.99)
     ema_decay: float = 0.999
-    max_steps: int = 200_000
-    warmup_steps: int = 1_000
+    #: The LR cosine runs over exactly max_steps, so shortening the run also
+    #: shortens the schedule. 25k is ~10 minutes at 40 it/s; early stopping
+    #: will usually end it sooner.
+    max_steps: int = 25_000
+    warmup_steps: int = 500
     grad_clip: float = 1.0
     log_every: int = 100
-    val_every: int = 2_000
-    ckpt_every: int = 5_000
+    val_every: int = 500
+    ckpt_every: int = 2_000
     num_workers: int = 4
     device: str = "cuda"
     amp: bool = True
     out_dir: str = "runs/mischmasch"
+
+    # ---- validation, checkpoint selection, and failure guards ----
+    #: crops used per validation pass, as a FIXED random subset drawn across
+    #: every validation simulation and every start month (not the first N in
+    #: index order, which would only ever see the earliest years of the first
+    #: validation run).
+    val_batches: int = 40
+    #: write best.pt whenever the validation loss improves. Without this the
+    #: only artefact is last.pt, and a run that overfits or collapses leaves
+    #: nothing usable behind.
+    save_best: bool = True
+    #: stop after this many consecutive validations without improvement.
+    #: 0 disables. 12 x val_every = 6000 steps of patience by default.
+    early_stop_patience: int = 12
+    #: abort if the validation loss exceeds the best seen by this factor --
+    #: catches a training collapse instead of grinding on for hours in a worse
+    #: basin. 0 disables.
+    spike_abort_ratio: float = 1.25
+    #: skip the optimiser step when the gradient norm is not finite, rather
+    #: than letting one bad batch move the weights somewhere unrecoverable.
+    skip_nonfinite_grads: bool = True
+
     #: NOTE: classifier-free guidance is deliberately NOT implemented.
     #: CFG shrinks sample diversity, which for an ensemble emulator destroys
     #: exactly the quantity you are trying to reproduce.
@@ -191,6 +228,21 @@ class Config:
             raise ValueError(f"model.n_esm must be >= 1, got {m.n_esm}")
         if self.diffusion.schedule not in ("cosine", "linear"):
             raise ValueError(f"diffusion.schedule: {self.diffusion.schedule!r}")
+        t = self.train
+        if t.val_batches < 1:
+            raise ValueError(f"train.val_batches must be >= 1, got {t.val_batches}")
+        if t.early_stop_patience < 0:
+            raise ValueError("train.early_stop_patience must be >= 0")
+        if t.spike_abort_ratio and t.spike_abort_ratio <= 1.0:
+            raise ValueError(
+                f"train.spike_abort_ratio must be > 1 (or 0 to disable), "
+                f"got {t.spike_abort_ratio}"
+            )
+        if t.warmup_steps >= t.max_steps:
+            raise ValueError(
+                f"train.warmup_steps ({t.warmup_steps}) must be < "
+                f"train.max_steps ({t.max_steps})"
+            )
         return self
 
     # -- reporting ---------------------------------------------------------
@@ -204,11 +256,16 @@ class Config:
             f"  context     : {cl[0]}..{cl[-1]} step 12 ({len(cl)} lengths), "
             f"p_no_context={d.p_no_context}",
             f"  pr transform: {d.pr_transform}",
-            f"  denoiser    : d_model={m.d_model} depth={m.depth} heads={m.n_heads}",
+            f"  denoiser    : d_model={m.d_model} depth={m.depth} heads={m.n_heads} "
+            f"qk_norm={m.qk_norm}",
             f"  gmt encoder : d_model={m.gmt_d_model} depth={m.gmt_depth} "
             f"max_years={m.gmt_max_years}",
             f"  training    : {t.max_steps} steps, batch {t.batch_size}, lr {t.lr:g}, "
-            f"amp={t.amp}, device={t.device}",
+            f"wd={t.weight_decay:g}, dropout={m.dropout:g}, amp={t.amp}",
+            f"  validation  : every {t.val_every} steps on {t.val_batches} batches, "
+            f"save_best={t.save_best}, patience={t.early_stop_patience}, "
+            f"spike_abort={t.spike_abort_ratio:g}",
+            f"  device      : {t.device}",
             f"  out_dir     : {t.out_dir}",
         ])
 
@@ -222,9 +279,14 @@ class Config:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
+        model_d = dict(d.get("model", {}))
+        if d.get("model") is not None and "qk_norm" not in model_d:
+            # checkpoint predates QK-norm; keep its architecture so its state
+            # dict still loads instead of failing on missing keys
+            model_d["qk_norm"] = False
         return cls(
             data=DataConfig(**{**asdict(DataConfig()), **d.get("data", {})}),
-            model=ModelConfig(**{**asdict(ModelConfig()), **d.get("model", {})}),
+            model=ModelConfig(**{**asdict(ModelConfig()), **model_d}),
             diffusion=DiffusionConfig(
                 **{**asdict(DiffusionConfig()), **d.get("diffusion", {})}
             ),

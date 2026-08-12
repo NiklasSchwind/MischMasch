@@ -50,8 +50,40 @@ def sinusoidal_positions(n: int, dim: int, device=None) -> torch.Tensor:
     return timestep_embedding(pos, dim)
 
 
+class RMSNorm(nn.Module):
+    """RMS normalisation, computed in fp32 so it is safe under bf16 autocast."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dt = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (xf * self.weight.float()).to(dt)
+
+
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0, causal: bool = False):
+    """Multi-head self-attention with optional QK normalisation.
+
+    QK-norm exists because of a real failure: the first 200k-step
+    ACCESS-ESM1-5 run collapsed at step ~166k -- training loss ramped 0.46 ->
+    0.83 over ~1300 steps and never recovered, with finite gradients and a
+    smoothly decaying LR throughout. That is the signature of attention
+    entropy collapse: QK logits grow until the softmax saturates toward
+    one-hot, gradients through attention vanish, and the model cannot climb
+    back out.
+
+    Normalising q and k to unit RMS before the dot product bounds the logits
+    at roughly +/- sqrt(head_dim) regardless of how large the projections
+    grow, which makes that runaway self-limiting. Costs two vectors of
+    parameters per attention layer and no measurable time.
+    """
+
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.0,
+                 causal: bool = False, qk_norm: bool = True):
         super().__init__()
         assert dim % n_heads == 0
         self.n_heads = n_heads
@@ -60,11 +92,17 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
         self.dropout = dropout
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)  # each (B, H, L, hd)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
         out = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0,
@@ -94,10 +132,11 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 class DiTBlock(nn.Module):
     """Pre-LN transformer block with adaLN-Zero conditioning (Peebles & Xie)."""
 
-    def __init__(self, dim: int, n_heads: int, mlp_ratio: float, dropout: float = 0.0):
+    def __init__(self, dim: int, n_heads: int, mlp_ratio: float, dropout: float = 0.0,
+                 qk_norm: bool = True):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.attn = SelfAttention(dim, n_heads, dropout)
+        self.attn = SelfAttention(dim, n_heads, dropout, qk_norm=qk_norm)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = Mlp(dim, mlp_ratio, dropout)
         self.ada = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
@@ -114,10 +153,11 @@ class DiTBlock(nn.Module):
 class PlainBlock(nn.Module):
     """Ordinary pre-LN block, used inside the (unconditioned) GMT encoder."""
 
-    def __init__(self, dim: int, n_heads: int, mlp_ratio: float = 4.0, causal: bool = True):
+    def __init__(self, dim: int, n_heads: int, mlp_ratio: float = 4.0,
+                 causal: bool = True, qk_norm: bool = True):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = SelfAttention(dim, n_heads, causal=causal)
+        self.attn = SelfAttention(dim, n_heads, causal=causal, qk_norm=qk_norm)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = Mlp(dim, mlp_ratio)
 
@@ -155,9 +195,10 @@ class GMTEncoder(nn.Module):
             "pos", sinusoidal_positions(m.gmt_max_years, d), persistent=False
         )
         self.pos_proj = nn.Linear(d, d)
-        self.blocks = nn.ModuleList(
-            [PlainBlock(d, m.gmt_heads, causal=True) for _ in range(m.gmt_depth)]
-        )
+        self.blocks = nn.ModuleList([
+            PlainBlock(d, m.gmt_heads, causal=True, qk_norm=m.qk_norm)
+            for _ in range(m.gmt_depth)
+        ])
         self.norm = nn.LayerNorm(d)
         self.head = nn.Sequential(
             nn.Linear(d + n_feats, m.cond_dim), nn.SiLU(),
@@ -214,7 +255,8 @@ class MischMaschDiT(nn.Module):
         nn.init.zeros_(self.esm_emb.weight)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(d, cfg.model.n_heads, cfg.model.mlp_ratio, cfg.model.dropout)
+            DiTBlock(d, cfg.model.n_heads, cfg.model.mlp_ratio, cfg.model.dropout,
+                     qk_norm=cfg.model.qk_norm)
             for _ in range(cfg.model.depth)
         ])
         self.norm_out = nn.LayerNorm(d, elementwise_affine=False, eps=1e-6)

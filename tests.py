@@ -167,6 +167,57 @@ def test_causal_gmt_encoder():
     print(f"  GMT encoder causality OK (future delta {d:.2e})")
 
 
+def test_qk_norm_bounds_attention_logits():
+    """QK-norm must cap the pre-softmax logits however large the inputs get.
+
+    Unbounded logit growth is the mechanism behind attention entropy collapse,
+    which is what ended the first 200k-step run at step ~166k.
+    """
+    import torch.nn.functional as Fn
+    from misch_masch.model import SelfAttention
+
+    def max_logit(attn, scale):
+        seen = {}
+        orig = Fn.scaled_dot_product_attention
+
+        def spy(q, k, v, **kw):
+            seen["m"] = ((q @ k.transpose(-1, -2)) / q.shape[-1] ** 0.5).abs().max().item()
+            return orig(q, k, v, **kw)
+
+        Fn.scaled_dot_product_attention = spy
+        try:
+            attn(torch.randn(2, 32, 64) * scale)
+        finally:
+            Fn.scaled_dot_product_attention = orig
+        return seen["m"]
+
+    torch.manual_seed(0)
+    on = SelfAttention(64, 4, qk_norm=True).eval()
+    off = SelfAttention(64, 4, qk_norm=False).eval()
+    head_dim = 64 // 4
+    bound = head_dim ** 0.5
+
+    small_on, big_on = max_logit(on, 1.0), max_logit(on, 100.0)
+    small_off, big_off = max_logit(off, 1.0), max_logit(off, 100.0)
+
+    assert big_on <= bound * 1.05, f"qk_norm logit {big_on} exceeds sqrt(hd)={bound}"
+    assert big_on / small_on < 1.5, "qk_norm logits should barely move with input scale"
+    assert big_off / small_off > 100, "control: unnormalised logits must blow up"
+    assert big_off > 50 * big_on
+    print(f"  qk_norm bounds logits OK (x100 input: {big_on:.2f} with, "
+          f"{big_off:.0f} without; sqrt(head_dim)={bound:.2f})")
+
+
+def test_qk_norm_checkpoint_back_compat():
+    """A config dict saved before qk_norm existed must load as qk_norm=False."""
+    from misch_masch.config import Config as C
+    d = tiny_cfg().to_dict()
+    d["model"].pop("qk_norm")
+    assert C.from_dict(d).model.qk_norm is False
+    assert C.from_dict(tiny_cfg().to_dict()).model.qk_norm is True
+    print("  pre-qk_norm checkpoints still load OK")
+
+
 def test_diffusion_identities():
     dif = Diffusion(200, "cosine")
     x0 = torch.randn(4, C, 96)
@@ -250,6 +301,75 @@ def test_member_diversity_and_determinism():
     spread = a.std(axis=0).mean()
     assert spread > 0, "members are identical -- no ensemble spread"
     print(f"  seeding + member diversity OK (mean across-member std {spread:.4g})")
+
+
+def _run_with_scripted_val(vals, patience, spike, out_dir):
+    """Train a tiny model while forcing validate() to return a fixed sequence."""
+    import os
+    import misch_masch.train as T
+
+    cfg = tiny_cfg(**{
+        "data.val_fraction": 0.5, "train.max_steps": 200, "train.warmup_steps": 2,
+        "train.batch_size": 4, "train.log_every": 10**9, "train.val_every": 5,
+        "train.ckpt_every": 10**9, "train.val_batches": 1,
+        "train.early_stop_patience": patience, "train.spike_abort_ratio": spike,
+        "train.out_dir": out_dir,
+    })
+    sims = [make_sim(40) for _ in range(4)]
+    seq = iter(vals)
+    orig = T.validate
+    T.validate = lambda *a, **k: next(seq)
+    try:
+        out = T.train_from_sims(sims, cfg, groups=["a", "a", "b", "b"], verbose=False)
+    finally:
+        T.validate = orig
+    return out, os.path.join(out_dir, "best.pt")
+
+
+def test_best_checkpoint_and_early_stop():
+    import os
+    vals = [1.0, 0.9, 0.80, 0.85, 0.86, 0.87, 0.88, 0.89] + [0.9] * 20
+    out, best = _run_with_scripted_val(vals, patience=3, spike=0, out_dir="runs/test_best")
+    assert os.path.exists(best), "best.pt was not written"
+    assert abs(out["best_val"] - 0.80) < 1e-9, out["best_val"]
+    assert out["best_step"] == 15, out["best_step"]          # third validation
+    assert out["best_path"] == best
+    assert "no improvement" in (out["stop_reason"] or ""), out["stop_reason"]
+    ck = torch.load(best, map_location="cpu", weights_only=False)
+    assert ck["step"] == 15 and abs(ck["extra"]["val_loss"] - 0.80) < 1e-9
+    assert ck["ema"] is not None and "normalizer" in ck and "config" in ck
+    print(f"  best.pt + early stopping OK (best {out['best_val']:.2f} @ "
+          f"step {out['best_step']}, stopped early)")
+
+
+def test_spike_abort():
+    vals = [1.0, 0.50, 0.90] + [0.9] * 40      # 0.90 > 0.50 * 1.25
+    out, _ = _run_with_scripted_val(vals, patience=0, spike=1.25,
+                                    out_dir="runs/test_spike")
+    assert "collapsed" in (out["stop_reason"] or ""), out["stop_reason"]
+    assert abs(out["best_val"] - 0.50) < 1e-9
+    print(f"  collapse abort OK (fired at step {out['best_step'] + 5}, "
+          f"kept best {out['best_val']:.2f})")
+
+
+def test_val_loader_covers_whole_val_set():
+    """The validation subset must span every val sim, not just the first."""
+    from misch_masch.train import make_val_loader
+    cfg = tiny_cfg(**{"train.val_batches": 8, "train.batch_size": 4})
+    sims = [make_sim(40) for _ in range(3)]
+    nrm = Normalizer.fit(sims, cfg.data)
+    ds = CropDataset(sims, nrm, cfg, [0, 1, 2], train=False)
+    dl = make_val_loader(ds, cfg)
+    picked = sorted(dl.dataset.indices)
+    assert len(picked) == 32
+    locals_ = {ds.index[i][0] for i in picked}
+    starts = [ds.index[i][1] for i in picked]
+    assert locals_ == {0, 1, 2}, f"only saw sims {locals_}"
+    assert max(starts) > 0.5 * max(x for _, x in ds.index), "only early windows"
+    # and it must be the same subset every time
+    assert sorted(make_val_loader(ds, cfg).dataset.indices) == picked
+    print(f"  val subset spans {len(locals_)} sims, starts up to month "
+          f"{max(starts)}, reproducible")
 
 
 if __name__ == "__main__":

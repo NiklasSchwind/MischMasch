@@ -45,7 +45,7 @@ import torch
 from emuvaluate.data_preparation import load_scenarios
 
 from misch_masch import Config, ScenarioSampler, train_from_sims
-from misch_masch.config import DataConfig, DiffusionConfig, TrainConfig
+from misch_masch.config import DataConfig, DiffusionConfig, ModelConfig, TrainConfig
 
 # --------------------------------------------------------------------------
 
@@ -225,6 +225,7 @@ def build_config(args) -> Config:
     setopt(cfg.model, "d_model", args.d_model)
     setopt(cfg.model, "depth", args.depth)
     setopt(cfg.model, "n_heads", args.n_heads)
+    setopt(cfg.model, "dropout", args.dropout)
 
     setopt(cfg.diffusion, "sample_steps", args.sample_steps)
 
@@ -235,6 +236,11 @@ def build_config(args) -> Config:
     setopt(cfg.train, "num_workers", args.num_workers)
     setopt(cfg.train, "val_every", args.val_every)
     setopt(cfg.train, "ckpt_every", args.ckpt_every)
+    setopt(cfg.train, "weight_decay", args.weight_decay)
+    setopt(cfg.train, "warmup_steps", args.warmup_steps)
+    setopt(cfg.train, "val_batches", args.val_batches)
+    setopt(cfg.train, "early_stop_patience", args.early_stop_patience)
+    setopt(cfg.train, "spike_abort_ratio", args.spike_abort_ratio)
     if args.no_amp:
         cfg.train.amp = False
     cfg.train.out_dir = os.path.join(args.out_root, "models", args.run_name)
@@ -264,7 +270,7 @@ def check_device(cfg: Config, allow_cpu: bool) -> None:
 
 
 def main() -> None:
-    _d, _t, _f = DataConfig(), TrainConfig(), DiffusionConfig()
+    _d, _t, _f, _m = DataConfig(), TrainConfig(), DiffusionConfig(), ModelConfig()
 
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -289,9 +295,22 @@ def main() -> None:
     g.add_argument("--january-start", dest="january_start", default=None,
                    action=argparse.BooleanOptionalAction,
                    help=f"config: {_d.january_start}")
-    g.add_argument("--d-model", type=int, default=None, help="config: see config.py")
-    g.add_argument("--depth", type=int, default=None, help="config: see config.py")
-    g.add_argument("--n-heads", type=int, default=None, help="config: see config.py")
+    g.add_argument("--d-model", type=int, default=None, help=f"config: {_m.d_model}")
+    g.add_argument("--depth", type=int, default=None, help=f"config: {_m.depth}")
+    g.add_argument("--n-heads", type=int, default=None, help=f"config: {_m.n_heads}")
+    g.add_argument("--dropout", type=float, default=None, help=f"config: {_m.dropout:g}")
+    g.add_argument("--weight-decay", type=float, default=None,
+                   help=f"config: {_t.weight_decay:g}")
+    g.add_argument("--warmup-steps", type=int, default=None,
+                   help=f"config: {_t.warmup_steps}")
+    g.add_argument("--val-batches", type=int, default=None,
+                   help=f"config: {_t.val_batches}")
+    g.add_argument("--early-stop-patience", type=int, default=None,
+                   help=f"validations without improvement before stopping, "
+                        f"0 disables (config: {_t.early_stop_patience})")
+    g.add_argument("--spike-abort-ratio", type=float, default=None,
+                   help=f"abort if val exceeds best by this factor, 0 disables "
+                        f"(config: {_t.spike_abort_ratio:g})")
     g.add_argument("--val-fraction", type=float, default=None,
                    help=f"config: {_d.val_fraction}")
     g.add_argument("--val-every", type=int, default=None, help=f"config: {_t.val_every}")
@@ -317,6 +336,11 @@ def main() -> None:
                         "i.e. 50%% overlap)")
     r.add_argument("--no-ema", action="store_true",
                    help="sample from the raw weights instead of the EMA")
+    r.add_argument("--checkpoint", default=None,
+                   help="explicit checkpoint to emulate from; default is "
+                        "best.pt (lowest validation loss), falling back to last.pt")
+    r.add_argument("--use-last", action="store_true",
+                   help="emulate from last.pt even when best.pt exists")
     args = p.parse_args()
 
     cfg = build_config(args)
@@ -325,7 +349,16 @@ def main() -> None:
     test_dir = os.path.join(args.out_root, "test_data")
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
-    ckpt = os.path.join(model_dir, "last.pt")
+    last_path = os.path.join(model_dir, "last.pt")
+    best_path = os.path.join(model_dir, "best.pt")
+
+    def resolve_checkpoint() -> str:
+        """Prefer the lowest-validation-loss checkpoint, not the final one."""
+        if args.checkpoint:
+            return args.checkpoint
+        if args.use_last:
+            return last_path
+        return best_path if os.path.exists(best_path) else last_path
 
     # stride / overlap
     stride = args.stride if args.stride is not None else cfg.data.window // 2
@@ -359,12 +392,19 @@ def main() -> None:
                   "--d-model 192 --depth 4, and watch the validation loss.")
 
         print("\n=== training " + "=" * 49)
-        train_from_sims(sims, cfg, groups=groups)
+        out = train_from_sims(sims, cfg, groups=groups)
         del sims
+        if out["best_val"] is not None:
+            print(f"[train] best validation loss {out['best_val']:.4f} at step "
+                  f"{out['best_step']}")
     else:
-        if not os.path.exists(ckpt):
-            raise SystemExit(f"[fatal] --skip-train given but {ckpt} does not exist")
-        print(f"\n[skip-train] reusing {ckpt}")
+        print("\n[skip-train] reusing an existing checkpoint")
+
+    ckpt = resolve_checkpoint()
+    if not os.path.exists(ckpt):
+        raise SystemExit(f"[fatal] checkpoint {ckpt} does not exist")
+    print(f"[checkpoint] emulating from {ckpt}"
+          + ("" if ckpt == best_path else "  (NOT the best-validation checkpoint)"))
 
     # ----------------------------------------------------------- emulate
     print("\n=== loading test scenario " + "=" * 36)
