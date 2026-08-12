@@ -28,7 +28,7 @@ class DataConfig:
     start_month: int = 0
 
     # ---- cropping ----
-    window: int = 240  # months per generated piece (must be a multiple of 12)
+    window: int = 480  # months per generated piece (must be a multiple of 12)
     #: if True, crops start at X with X % 12 == 0 (i.e. always January).
     #: False gives 12x the crops as seasonal-phase augmentation; the model
     #: carries a per-token calendar-month embedding either way.
@@ -105,7 +105,7 @@ class ModelConfig:
     n_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.1
-    max_window: int = 256  # capacity of the learned positional table
+    max_window: int = 512  # capacity of the learned positional table
     #: normalise q and k to unit RMS before the attention dot product. This
     #: bounds the logits at ~sqrt(head_dim) however large the projections grow,
     #: which prevents attention entropy collapse -- the failure that ended the

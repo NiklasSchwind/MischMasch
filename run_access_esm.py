@@ -470,6 +470,9 @@ def main() -> None:
     with open(os.path.join(model_dir, "esm_ids.json"), "w") as f:
         json.dump(esm_index, f, indent=2)
 
+    with open(os.path.join(model_dir, "configs.txt"), "w") as f:
+        f.write(cfg.summary())
+
     # ---------------------------------------------------------------- train
     if not args.skip_train:
         print("\n=== loading training data " + "=" * 36)

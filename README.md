@@ -91,33 +91,45 @@ ens = s.sample(gmt, n_members=20, area_weights=region_area_fractions)
 `region_area_fractions` is a length-`n_tas` array summing to 1. Only physically
 meaningful if your `tas` regions tile the globe.
 
-## ACCESS-ESM1-5 driver script
+## Multi-ESM driver script
 
-`run_access_esm.py` does the full IIASA run: load the training scenarios via
-`emuvaluate.data_preparation.load_scenarios`, train, then emulate `ssp245`.
+`run_access_esm.py` (name is a leftover — rename freely, just update the sbatch
+line) loads the training scenarios for **five CMIP6 models** via
+`emuvaluate.data_preparation.load_scenarios`, trains one model over all of them,
+then emulates `ssp245` for each:
+
+```
+CanESM5  ACCESS-ESM1-5  MPI-ESM1-2-LR  MIROC6  IPSL-CM6A-LR
+```
+
+Models are distinguished by the learned ESM embedding (`model.n_esm = 5`), which
+is zero-initialised, so nothing else about the architecture changes.
 
 ```bash
-python run_access_esm.py                       # train + emulate
+python run_access_esm.py                       # train + emulate all five
 python run_access_esm.py --skip-train          # reuse the checkpoint, re-emulate
-python run_access_esm.py --max-steps 50000 --members-per-gmt 10
+python run_access_esm.py --models CanESM5,MIROC6
+python run_access_esm.py --max-members-per-scenario 10   # bound memory
 ```
 
 Writes to `/hdrive/all_users/schwind/MischMasch` (change with `--out-root`):
 
 ```
-models/access-esm1-5/best.pt        lowest-validation-loss checkpoint
+models/cmip6-5models/best.pt        lowest-validation-loss checkpoint
                                     (model + EMA + normaliser + config)
                                     -- this is what inference uses
-models/access-esm1-5/last.pt        final step, for inspection
-models/access-esm1-5/config.json
-test_data/ssp245_emulated.npy       object array of (117, T) arrays,
-                                    same layout load_scenarios hands out,
-                                    physical units, GMT row preserved
-test_data/ssp245_emulated_tas.npy   (n_tas, T) blocks
-test_data/ssp245_emulated_pr.npy    (n_pr, T) blocks
-test_data/ssp245_reference.npy      the ESM ssp245 members, unmodified
-test_data/metadata.json             which emulated array came from which
-                                    source member, plus seeds and full config
+models/cmip6-5models/last.pt        final step, for inspection
+models/cmip6-5models/config.json
+models/cmip6-5models/esm_ids.json   {model name: embedding index}
+test_data/ssp245_<MODEL>_emulated.npy       object array of (117, T) arrays,
+                                            same layout load_scenarios hands
+                                            out, physical units, GMT row kept
+test_data/ssp245_<MODEL>_emulated_tas.npy   (n_tas, T) blocks
+test_data/ssp245_<MODEL>_emulated_pr.npy    (n_pr, T) blocks
+test_data/ssp245_<MODEL>_reference.npy      that ESM's members, unmodified
+test_data/metadata.json                     one file covering all models: which
+                                            emulated array came from which
+                                            source member, seeds, full config
 ```
 
 ```python
@@ -141,6 +153,29 @@ Three things the script does on purpose:
   with `--allow-cpu`.
 * **Emulates from `best.pt`**, not the final step. `--use-last` or
   `--checkpoint PATH` to override.
+* **Balances ESM sampling** (`train.balance_esms`). Member counts differ several
+  fold between models, so uniform crop sampling would let one dominate the
+  shared weights while the others rode on the embedding.
+* **Splits train/val within each model** (`strata`), so `val_fraction` of
+  *every* model's scenarios is held out. A global draw can leave one model with
+  no validation data — which is the model you most wanted to check.
+* **Reports validation loss per model** as well as as a balanced mean, and the
+  balanced mean is what drives best-checkpoint selection and early stopping:
+
+```
+step   12000  VAL loss 0.5241  best 0.5241 @ 12000  *  [CanESM5=0.58 ACCESS-ESM1-5=0.51 ...]
+```
+
+  That per-model breakdown is the diagnostic for whether the embedding is
+  earning its keep — a model whose loss sits well above the others is not being
+  served by the shared weights.
+
+**Known limitation of this configuration:** normalisation statistics are fitted
+**pooled across all five models**. They differ in climatology, seasonal-cycle
+amplitude and variance, so the embedding has to spend capacity undoing a
+preprocessing choice. Per-ESM normalisation statistics are the obvious next
+improvement and would likely matter more than the conditioning mechanism itself.
+The driver prints this warning at startup so it does not get forgotten.
 
 Emulated members are generated per source `ssp245` member (each conditioned on
 that member's own GMT, matching how the model was trained),
@@ -159,7 +194,7 @@ So the loop now:
 | setting | default | what it does |
 |---|---|---|
 | `train.save_best` | `True` | writes `best.pt` on every validation improvement |
-| `train.early_stop_patience` | `12` | stops after 12 validations with no improvement (0 disables) |
+| `train.early_stop_patience` | `20` | stops after 20 **consecutive** validations with no new best (0 disables). The counter resets only on a new best, so a single small rise costs one tick and can never stop a run by itself. |
 | `train.spike_abort_ratio` | `1.25` | aborts if val exceeds the best by 25% — catches a collapse instead of training through it |
 | `train.skip_nonfinite_grads` | `True` | drops an update whose gradient norm is not finite rather than letting one batch move the weights somewhere unrecoverable |
 | `train.val_batches` | `40` | a **fixed random subset spread across all validation sims and start months** — iterating the first N batches in index order only ever saw the earliest months of the first validation run |
@@ -331,11 +366,15 @@ earning its keep. That comparison is the honest headline result.
 
 ## Extensions with hooks already in place
 
-* **Multiple ESMs.** Set `cfg.model.n_esm = <n>` and pass `esm_ids=[...]` (one
-  per simulation) to `train_from_sims`; pass `esm_id=` to
-  `ScenarioSampler.sample`. The embedding is zero-initialised, so a single-model
-  run is unchanged. Group your train/val split by ESM if you want to test
-  out-of-sample generalisation across models.
+* **More ESMs.** Add names to `MODELS` in the driver and raise
+  `cfg.model.n_esm` to match (the driver refuses to start on a mismatch).
+* **Per-ESM normalisation** — see the limitation noted above. Probably the
+  highest-value next change for multi-model work.
+* **Unseen-ESM generalisation.** The embedding cannot do this by construction.
+  Two routes: freeze the network and fit a single new embedding vector on a
+  small sample (textual-inversion style), or add a permutation-invariant
+  encoder over crops from the target model that emits a vector into the same
+  conditioning slot. Validate either with leave-one-ESM-out.
 * **Axial attention over regions.** Alternate the existing time-attention
   blocks with attention over 116 region tokens plus learned region embeddings.
   Useful if you want the model to reason about regions explicitly, or to
