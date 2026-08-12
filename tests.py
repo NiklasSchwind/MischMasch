@@ -318,7 +318,7 @@ def _run_with_scripted_val(vals, patience, spike, out_dir):
     sims = [make_sim(40) for _ in range(4)]
     seq = iter(vals)
     orig = T.validate
-    T.validate = lambda *a, **k: next(seq)
+    T.validate = lambda *a, **k: (next(seq), {})
     try:
         out = T.train_from_sims(sims, cfg, groups=["a", "a", "b", "b"], verbose=False)
     finally:
@@ -326,20 +326,76 @@ def _run_with_scripted_val(vals, patience, spike, out_dir):
     return out, os.path.join(out_dir, "best.pt")
 
 
+def test_stratified_group_split():
+    """val_fraction must be held out WITHIN each ESM, not by a global draw."""
+    from misch_masch.data import group_split
+    models = ["A", "B", "C"]
+    groups, strata = [], []
+    for m in models:
+        for sc in range(6):
+            for _member in range(2):
+                groups.append(f"{m}/ssp{sc}")
+                strata.append(m)
+    tr, va = group_split(len(groups), groups, 0.34, seed=0, strata=strata)
+    assert set(tr) & set(va) == set()
+    assert {groups[i] for i in tr} & {groups[i] for i in va} == set()
+    for m in models:
+        assert any(strata[i] == m for i in va), f"{m} has no validation data"
+        assert any(strata[i] == m for i in tr), f"{m} has no training data"
+    # a group spanning two strata is a mistake worth catching
+    try:
+        group_split(4, ["g", "g", "h", "h"], 0.5, strata=["A", "B", "A", "B"])
+    except ValueError as e:
+        assert "more than one stratum" in str(e)
+    else:
+        raise AssertionError("expected a ValueError for a cross-stratum group")
+    n_val = {m: len({groups[i] for i in va if strata[i] == m}) for m in models}
+    print(f"  stratified split OK (val groups per model: {n_val})")
+
+
+def test_balanced_esm_sampling_and_per_esm_val():
+    from misch_masch.train import (crop_esm_ids, make_train_sampler,
+                                   make_val_loaders)
+    cfg = tiny_cfg(**{"train.batch_size": 4, "train.val_batches": 6})
+    sims = [make_sim(40) for _ in range(4)]
+    nrm = Normalizer.fit(sims, cfg.data)
+    # ESM 0 gets 3 sims, ESM 1 gets 1 -> a 3:1 imbalance to correct
+    ds = CropDataset(sims, nrm, cfg, [0, 1, 2, 3], esm_ids=[0, 0, 0, 1], train=True)
+    raw = np.bincount(crop_esm_ids(ds), minlength=2)
+    sampler = make_train_sampler(ds, cfg)
+    drawn = np.bincount(crop_esm_ids(ds)[list(sampler)], minlength=2)
+    frac = drawn / drawn.sum()
+    assert abs(frac[0] - 0.5) < 0.05, frac
+    assert cfg.train.balance_esms
+
+    cfg_off = tiny_cfg(**{"train.balance_esms": False})
+    assert make_train_sampler(ds, cfg_off) is None
+
+    loaders = make_val_loaders(ds, cfg)
+    assert set(loaders) == {0, 1}
+    for esm, dl in loaders.items():
+        seen = {int(b["esm_id"][0]) for b in dl}
+        assert seen == {esm}, seen
+    print(f"  ESM balancing OK (raw {raw.tolist()} -> drawn "
+          f"{np.round(frac, 3).tolist()}), per-ESM val loaders OK")
+
+
 def test_best_checkpoint_and_early_stop():
+    """A single small rise must NOT stop the run; only a sustained one does."""
     import os
-    vals = [1.0, 0.9, 0.80, 0.85, 0.86, 0.87, 0.88, 0.89] + [0.9] * 20
-    out, best = _run_with_scripted_val(vals, patience=3, spike=0, out_dir="runs/test_best")
-    assert os.path.exists(best), "best.pt was not written"
-    assert abs(out["best_val"] - 0.80) < 1e-9, out["best_val"]
-    assert out["best_step"] == 15, out["best_step"]          # third validation
-    assert out["best_path"] == best
-    assert "no improvement" in (out["stop_reason"] or ""), out["stop_reason"]
+    # dips below best at index 5, so the counter resets and the run continues
+    vals = [1.0, 0.9, 0.80, 0.85, 0.86, 0.79, 0.84, 0.85, 0.86, 0.87] + [0.9] * 20
+    out, best = _run_with_scripted_val(vals, patience=3, spike=0,
+                                       out_dir="runs/test_best")
+    assert abs(out["best_val"] - 0.79) < 1e-9, out["best_val"]
+    assert out["best_step"] == 30, out["best_step"]   # sixth validation, after a rise
+    assert os.path.exists(best)
     ck = torch.load(best, map_location="cpu", weights_only=False)
-    assert ck["step"] == 15 and abs(ck["extra"]["val_loss"] - 0.80) < 1e-9
+    assert ck["step"] == 30 and abs(ck["extra"]["val_loss"] - 0.79) < 1e-9
     assert ck["ema"] is not None and "normalizer" in ck and "config" in ck
-    print(f"  best.pt + early stopping OK (best {out['best_val']:.2f} @ "
-          f"step {out['best_step']}, stopped early)")
+    assert "no new best" in (out["stop_reason"] or ""), out["stop_reason"]
+    print(f"  a single rise does not stop the run; sustained rise does "
+          f"(best {out['best_val']:.2f} @ step {out['best_step']})")
 
 
 def test_spike_abort():
@@ -354,12 +410,12 @@ def test_spike_abort():
 
 def test_val_loader_covers_whole_val_set():
     """The validation subset must span every val sim, not just the first."""
-    from misch_masch.train import make_val_loader
+    from misch_masch.train import make_val_loaders
     cfg = tiny_cfg(**{"train.val_batches": 8, "train.batch_size": 4})
     sims = [make_sim(40) for _ in range(3)]
     nrm = Normalizer.fit(sims, cfg.data)
     ds = CropDataset(sims, nrm, cfg, [0, 1, 2], train=False)
-    dl = make_val_loader(ds, cfg)
+    dl = make_val_loaders(ds, cfg)[0]          # single ESM -> one loader
     picked = sorted(dl.dataset.indices)
     assert len(picked) == 32
     locals_ = {ds.index[i][0] for i in picked}
@@ -367,7 +423,7 @@ def test_val_loader_covers_whole_val_set():
     assert locals_ == {0, 1, 2}, f"only saw sims {locals_}"
     assert max(starts) > 0.5 * max(x for _, x in ds.index), "only early windows"
     # and it must be the same subset every time
-    assert sorted(make_val_loader(ds, cfg).dataset.indices) == picked
+    assert sorted(make_val_loaders(ds, cfg)[0].dataset.indices) == picked
     print(f"  val subset spans {len(locals_)} sims, starts up to month "
           f"{max(starts)}, reproducible")
 

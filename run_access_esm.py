@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""Train MISCH-MASCH on ACCESS-ESM1-5 and emulate ssp245.
+"""Train MISCH-MASCH on several CMIP6 ESMs and emulate ssp245 for each.
 
-    python run_access_esm.py                      # train + emulate
+(The filename is a leftover from the single-model version -- rename it freely,
+just update the sbatch line.)
+
+    python run_access_esm.py                      # train + emulate all models
     python run_access_esm.py --skip-train         # reuse existing checkpoint
-    python run_access_esm.py --max-steps 50000    # shorter run
+    python run_access_esm.py --models CanESM5,MIROC6
+
+Models are distinguished by a learned ESM embedding (``model.n_esm``), which is
+zero-initialised, so everything else about the pipeline is unchanged. Training
+crops are sampled so every model is seen equally often, the train/val split
+holds out scenarios *within* each model, and validation loss is reported per
+model as well as as a balanced mean.
 
 `misch_masch/config.py` is the single source of truth. Every flag below
 defaults to ``None`` and only overrides the corresponding config field when
-you pass it explicitly, so editing config.py is enough -- nothing here
-silently overwrites your settings. The resolved config is printed at startup
-and saved next to the checkpoint.
+you pass it explicitly.
 
 Outputs
 -------
-    <out-root>/models/<run-name>/last.pt        checkpoint (model + EMA +
-                                                normaliser + config: this file
-                                                alone is enough to reload)
+    <out-root>/models/<run-name>/best.pt         lowest-validation-loss
+                                                 checkpoint; inference uses it
+    <out-root>/models/<run-name>/last.pt
     <out-root>/models/<run-name>/config.json
-    <out-root>/test_data/ssp245_emulated.npy    object array of (1+n_tas+n_pr, T)
-                                                arrays in the SAME layout
-                                                emuvaluate hands out, physical
-                                                units
-    <out-root>/test_data/ssp245_emulated_tas.npy   (n_tas, T) blocks
-    <out-root>/test_data/ssp245_emulated_pr.npy    (n_pr, T) blocks
-    <out-root>/test_data/ssp245_reference.npy   the ESM ssp245 members, as-is
-    <out-root>/test_data/metadata.json          provenance for every array
+    <out-root>/models/<run-name>/esm_ids.json    {model name: embedding index}
+    <out-root>/test_data/ssp245_<MODEL>_emulated.npy      (1+n_tas+n_pr, T)
+    <out-root>/test_data/ssp245_<MODEL>_emulated_tas.npy  (n_tas, T)
+    <out-root>/test_data/ssp245_<MODEL>_emulated_pr.npy   (n_pr, T)
+    <out-root>/test_data/ssp245_<MODEL>_reference.npy     ESM members, as-is
+    <out-root>/test_data/metadata.json                    provenance for all
 
-Load the emulated data back with::
+Load any of them back with::
 
     sims = list(np.load(path, allow_pickle=True))
 """
@@ -37,7 +42,7 @@ import argparse
 import json
 import os
 import time
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -49,13 +54,21 @@ from misch_masch.config import DataConfig, DiffusionConfig, ModelConfig, TrainCo
 
 # --------------------------------------------------------------------------
 
-MODEL = "ACCESS-ESM1-5"
+MODELS = [
+    "CanESM5",
+    "ACCESS-ESM1-5",
+    "MPI-ESM1-2-LR",
+    "MIROC6",
+    "IPSL-CM6A-LR",
+]
+
+MODEL_ROOT = "/projects/icigroup/CMIP6/cmip6-ng-inc-oceans"
 
 TRAIN_SCENARIOS = [
     "flat10-from-025",
     "flat10-zec-from-025",
     "flat10-cdr-from-025",
-    "ssp245",
+    "ssp126",
     "esm-1pct-brch-1000pgc-from-025",
     "esm-1pct-brch-750PgC",
     "esm-1pct-brch-2000PgC",
@@ -65,7 +78,7 @@ TRAIN_SCENARIOS = [
     "ssp460",
     "1pctco2",
 ]
-TEST_SCENARIOS = ["ssp126"]
+TEST_SCENARIOS = ["ssp245"]
 
 # NOTE: the row layout (n_tas / n_pr) is NOT defined here -- it comes from
 # misch_masch/config.py, so there is exactly one place to change it.
@@ -112,53 +125,92 @@ def _trim_to_whole_years(a: np.ndarray) -> np.ndarray:
     return a[:, : T - T % 12] if T % 12 else a
 
 
-def load(scenarios: Sequence[str], model: str, model_path: str, min_months: int
-         ) -> Tuple[List[np.ndarray], List[str]]:
-    """Load one scenario at a time, so we know each simulation's group label.
+def load_one(model: str, scenario: str, model_root: str, min_months: int,
+             max_members: int | None) -> List[np.ndarray]:
+    """Load one (model, scenario). Returns [] and warns if it is unavailable."""
+    t0 = time.time()
+    try:
+        raw = load_scenarios(
+            model=model,
+            indicators=["tas", "pr"],
+            scenarios=[scenario],
+            model_path=os.path.join(model_root, model),
+            pattern_scaling_residuals=False,
+            ramp_down_corrected_ps=False,
+            monthly_flag=True,
+            use_smoothing=False,
+            train_pattern_scaling_name=None,
+        )
+    except Exception as e:                    # noqa: BLE001
+        print(f"[warn] {model}/{scenario}: skipping ({type(e).__name__}: {e})",
+              flush=True)
+        return []
 
-    Group labels are what keep ensemble members of the same scenario -- and
-    scenarios that branch off a shared run -- on the same side of the
-    train/val split.  Loading everything in one call would lose that.
+    arrs = [_trim_to_whole_years(a) for a in _as_array_list(raw)]
+    short = sum(1 for a in arrs if a.shape[1] < min_months)
+    arrs = [a for a in arrs if a.shape[1] >= min_months]
+    if short:
+        print(f"[warn] {model}/{scenario}: dropped {short} member(s) shorter "
+              f"than the {min_months}-month window", flush=True)
+    if max_members is not None and len(arrs) > max_members:
+        print(f"[note] {model}/{scenario}: keeping {max_members} of "
+              f"{len(arrs)} members (--max-members-per-scenario)", flush=True)
+        arrs = arrs[:max_members]
+    if not arrs:
+        print(f"[warn] {model}/{scenario}: no usable simulations", flush=True)
+        return []
+    print(f"[load] {model:<16s} {scenario:<32s} {len(arrs):>3d} members, "
+          f"T = {sorted({a.shape[1] for a in arrs})}  ({time.time()-t0:.1f}s)",
+          flush=True)
+    return arrs
+
+
+def load_multi(models: Sequence[str], scenarios: Sequence[str], model_root: str,
+               esm_index: Dict[str, int], min_months: int,
+               max_members: int | None):
+    """Load every (model, scenario) pair.
+
+    Returns ``(sims, groups, esm_ids, strata)`` where
+      * ``groups`` = ``"<model>/<scenario>"`` -- the unit the train/val split
+        moves as a block, so ensemble members and branched scenarios never
+        straddle it;
+      * ``strata`` = the model, so ``val_fraction`` of scenarios is held out
+        *within each* model rather than by a global draw that could leave one
+        model with no validation data.
     """
     sims: List[np.ndarray] = []
     groups: List[str] = []
-    for sc in dict.fromkeys(scenarios):          # de-duplicate, keep order
-        t0 = time.time()
-        try:
-            raw = load_scenarios(
-                model=model,
-                indicators=["tas", "pr"],
-                scenarios=[sc],
-                model_path=model_path,
-                pattern_scaling_residuals=False,
-                ramp_down_corrected_ps=False,
-                monthly_flag=True,
-                use_smoothing=False,
-                train_pattern_scaling_name=None,
+    esm_ids: List[int] = []
+    strata: List[str] = []
+    for model in dict.fromkeys(models):
+        n_before = len(sims)
+        for sc in dict.fromkeys(scenarios):
+            arrs = load_one(model, sc, model_root, min_months, max_members)
+            sims.extend(arrs)
+            groups.extend([f"{model}/{sc}"] * len(arrs))
+            esm_ids.extend([esm_index[model]] * len(arrs))
+            strata.extend([model] * len(arrs))
+        got = len(sims) - n_before
+        if got == 0:
+            raise RuntimeError(
+                f"'{model}' yielded no simulations at all -- check the path "
+                f"{os.path.join(model_root, model)} and the scenario names"
             )
-        except Exception as e:                    # noqa: BLE001
-            print(f"[warn] skipping '{sc}': {type(e).__name__}: {e}", flush=True)
-            continue
-        arrs = [_trim_to_whole_years(a) for a in _as_array_list(raw)]
-        dropped = sum(1 for a in arrs if a.shape[1] < min_months)
-        arrs = [a for a in arrs if a.shape[1] >= min_months]
-        if dropped:
-            print(f"[warn] '{sc}': dropped {dropped} member(s) shorter than "
-                  f"the {min_months}-month window", flush=True)
-        if not arrs:
-            print(f"[warn] '{sc}' returned no usable simulations", flush=True)
-            continue
-        sims.extend(arrs)
-        groups.extend([sc] * len(arrs))
-        print(f"[load] {sc:<32s} {len(arrs):>3d} members, "
-              f"T = {sorted({a.shape[1] for a in arrs})}  ({time.time()-t0:.1f}s)",
-              flush=True)
+        print(f"[load] {model:<16s} TOTAL {got} simulations", flush=True)
     if not sims:
         raise RuntimeError("no simulations loaded")
-    return sims, groups
+
+    nbytes = sum(a.nbytes for a in sims)
+    print(f"[load] {len(sims)} simulations, {nbytes/2**30:.2f} GiB raw "
+          f"(the dataset keeps a normalised float32 copy too)", flush=True)
+    if nbytes / 2**30 > 12:
+        print("[warn] that is a lot of memory; the CropDataset roughly doubles "
+              "it and each dataloader worker may add more. Consider "
+              "--max-members-per-scenario or --num-workers 2.", flush=True)
+    return sims, groups, esm_ids, strata
 
 
-def verify_layout(sims: Sequence[np.ndarray], cfg: Config) -> None:
+def verify_layout(sims: Sequence[np.ndarray], cfg: Config, label: str = "") -> None:
     """Fail loudly if the row layout is not what the config assumes.
 
     Also checks the tas/pr split point by magnitude: tas is O(10), pr is
@@ -166,24 +218,26 @@ def verify_layout(sims: Sequence[np.ndarray], cfg: Config) -> None:
     silent and fatal, so it is worth the ten lines.
     """
     d = cfg.data
+    tag = f" [{label}]" if label else ""
     n_rows = sims[0].shape[0]
     if n_rows != d.n_rows:
         raise ValueError(
             f"expected {d.n_rows} rows (1 GMT + {d.n_tas} tas + {d.n_pr} pr), "
-            f"got {n_rows}. Fix data.n_tas / data.n_pr in misch_masch/config.py."
+            f"got {n_rows}{tag}. Fix data.n_tas / data.n_pr in "
+            f"misch_masch/config.py."
         )
     if not all(a.shape[0] == n_rows for a in sims):
-        raise ValueError("simulations have inconsistent row counts")
+        raise ValueError(f"simulations have inconsistent row counts{tag}")
 
     scale = np.mean([np.abs(a[1:]).mean(axis=1) for a in sims[:5]], axis=0)
     scale = np.maximum(scale, 1e-30)
     drop = int(np.argmax(np.log10(scale[:-1]) - np.log10(scale[1:]))) + 1
     ratio = scale[: d.n_tas].mean() / scale[d.n_tas :].mean()
-    print(f"[check] mean|tas| / mean|pr| = {ratio:.3g}")
+    print(f"[check]{tag} mean|tas| / mean|pr| = {ratio:.3g}")
     if drop != d.n_tas:
-        print(f"[warn] the largest magnitude break is after row {drop}, but "
-              f"data.n_tas = {d.n_tas}. Verify the tas/pr split in config.py "
-              f"before trusting anything downstream.")
+        print(f"[warn]{tag} the largest magnitude break is after row {drop}, "
+              f"but data.n_tas = {d.n_tas}. Verify the tas/pr split in "
+              f"config.py before trusting anything downstream.")
 
 
 # --------------------------------------------------------------------------
@@ -226,8 +280,10 @@ def build_config(args) -> Config:
     setopt(cfg.model, "depth", args.depth)
     setopt(cfg.model, "n_heads", args.n_heads)
     setopt(cfg.model, "dropout", args.dropout)
+    setopt(cfg.model, "n_esm", args.n_esm)
 
     setopt(cfg.diffusion, "sample_steps", args.sample_steps)
+    setopt(cfg.diffusion, "eta", args.eta)
 
     setopt(cfg.train, "device", args.device)
     setopt(cfg.train, "batch_size", args.batch_size)
@@ -241,6 +297,7 @@ def build_config(args) -> Config:
     setopt(cfg.train, "val_batches", args.val_batches)
     setopt(cfg.train, "early_stop_patience", args.early_stop_patience)
     setopt(cfg.train, "spike_abort_ratio", args.spike_abort_ratio)
+    setopt(cfg.train, "balance_esms", args.balance_esms)
     if args.no_amp:
         cfg.train.amp = False
     cfg.train.out_dir = os.path.join(args.out_root, "models", args.run_name)
@@ -274,11 +331,16 @@ def main() -> None:
 
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=MODEL)
-    p.add_argument("--model-path", default=None,
-                   help="default: /projects/icigroup/CMIP6/cmip6-ng-inc-oceans/<model>")
+    p.add_argument("--models", default=None,
+                   help=f"comma-separated ESMs (default: {','.join(MODELS)})")
+    p.add_argument("--model-root", default=MODEL_ROOT,
+                   help=f"parent directory of the per-model archives "
+                        f"(default: {MODEL_ROOT})")
     p.add_argument("--out-root", default="/hdrive/all_users/schwind/MischMasch")
-    p.add_argument("--run-name", default="access-esm1-5")
+    p.add_argument("--run-name", default="cmip6-5models")
+    p.add_argument("--max-members-per-scenario", type=int, default=None,
+                   help="cap members per (model, scenario) to bound memory; "
+                        "what is dropped is logged")
 
     g = p.add_argument_group(
         "config overrides",
@@ -299,20 +361,29 @@ def main() -> None:
     g.add_argument("--depth", type=int, default=None, help=f"config: {_m.depth}")
     g.add_argument("--n-heads", type=int, default=None, help=f"config: {_m.n_heads}")
     g.add_argument("--dropout", type=float, default=None, help=f"config: {_m.dropout:g}")
+    g.add_argument("--n-esm", type=int, default=None,
+                   help=f"size of the ESM embedding table (config: {_m.n_esm}); "
+                        f"must be >= the number of models")
+    g.add_argument("--balance-esms", dest="balance_esms", default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help=f"equalise how often each ESM is sampled "
+                        f"(config: {_t.balance_esms})")
     g.add_argument("--weight-decay", type=float, default=None,
                    help=f"config: {_t.weight_decay:g}")
     g.add_argument("--warmup-steps", type=int, default=None,
                    help=f"config: {_t.warmup_steps}")
     g.add_argument("--val-batches", type=int, default=None,
-                   help=f"config: {_t.val_batches}")
+                   help=f"total validation batches, split across models "
+                        f"(config: {_t.val_batches})")
     g.add_argument("--early-stop-patience", type=int, default=None,
-                   help=f"validations without improvement before stopping, "
-                        f"0 disables (config: {_t.early_stop_patience})")
+                   help=f"consecutive validations with no new best before "
+                        f"stopping, 0 disables (config: {_t.early_stop_patience})")
     g.add_argument("--spike-abort-ratio", type=float, default=None,
                    help=f"abort if val exceeds best by this factor, 0 disables "
                         f"(config: {_t.spike_abort_ratio:g})")
     g.add_argument("--val-fraction", type=float, default=None,
-                   help=f"config: {_d.val_fraction}")
+                   help=f"fraction of each model's scenarios held out "
+                        f"(config: {_d.val_fraction})")
     g.add_argument("--val-every", type=int, default=None, help=f"config: {_t.val_every}")
     g.add_argument("--ckpt-every", type=int, default=None, help=f"config: {_t.ckpt_every}")
     g.add_argument("--num-workers", type=int, default=None,
@@ -321,6 +392,9 @@ def main() -> None:
     g.add_argument("--seed", type=int, default=None, help=f"config: {_d.seed}")
     g.add_argument("--sample-steps", type=int, default=None,
                    help=f"config: {_f.sample_steps}")
+    g.add_argument("--eta", type=float, default=None,
+                   help=f"sampler stochasticity, 0 = deterministic DDIM "
+                        f"(config: {_f.eta:g})")
     g.add_argument("--no-amp", action="store_true",
                    help="disable bf16 autocast (required on pre-Ampere GPUs)")
 
@@ -343,8 +417,18 @@ def main() -> None:
                    help="emulate from last.pt even when best.pt exists")
     args = p.parse_args()
 
+    models = [m.strip() for m in args.models.split(",")] if args.models else list(MODELS)
+    models = list(dict.fromkeys(models))
+    esm_index = {m: i for i, m in enumerate(models)}
+
     cfg = build_config(args)
-    model_path = args.model_path or f"/projects/icigroup/CMIP6/cmip6-ng-inc-oceans/{args.model}"
+    if cfg.model.n_esm < len(models):
+        raise SystemExit(
+            f"[fatal] {len(models)} models requested but model.n_esm = "
+            f"{cfg.model.n_esm}. Set n_esm in misch_masch/config.py (or pass "
+            f"--n-esm {len(models)})."
+        )
+
     model_dir = cfg.train.out_dir
     test_dir = os.path.join(args.out_root, "test_data")
     os.makedirs(model_dir, exist_ok=True)
@@ -373,26 +457,39 @@ def main() -> None:
     check_device(cfg, args.allow_cpu)
     print(cfg.summary())
     print(f"  inference   : stride {stride}, overlap {overlap} months")
+    print(f"  models      : " + ", ".join(f"{m}={i}" for m, i in esm_index.items()))
     if overlap not in cfg.data.context_lengths:
         print(f"[warn] the inference overlap ({overlap}) is not in "
               f"data.context_lengths -- the model will be asked for a context "
               f"length it never saw. Expect seams.")
+    print("[note] normalisation statistics are fitted POOLED over all models. "
+          "Models differ in climatology, seasonal amplitude and variance, so "
+          "the ESM embedding has to absorb part of that. Per-ESM normalisation "
+          "is the obvious next improvement if results are uneven across models.")
+
+    with open(os.path.join(model_dir, "esm_ids.json"), "w") as f:
+        json.dump(esm_index, f, indent=2)
 
     # ---------------------------------------------------------------- train
     if not args.skip_train:
-        print("\n=== loading training scenarios " + "=" * 32)
-        sims, groups = load(TRAIN_SCENARIOS, args.model, model_path, cfg.data.window)
-        verify_layout(sims, cfg)
+        print("\n=== loading training data " + "=" * 36)
+        sims, groups, esm_ids, strata = load_multi(
+            models, TRAIN_SCENARIOS, args.model_root, esm_index,
+            cfg.data.window, args.max_members_per_scenario)
+        verify_layout(sims, cfg, "train")
         n_months = sum(a.shape[1] for a in sims)
         n_eff = n_months // cfg.data.window
-        print(f"[load] {len(sims)} simulations, {n_months} months total, "
-              f"~{n_eff} effective independent windows")
+        print(f"[load] {n_months} months total, ~{n_eff} effective independent "
+              f"windows across {len(models)} models")
         if n_eff < 5_000:
-            print("[note] that is a small effective sample count -- consider "
-                  "--d-model 192 --depth 4, and watch the validation loss.")
+            print("[note] that is a small effective sample count -- watch the "
+                  "per-model validation losses.")
 
         print("\n=== training " + "=" * 49)
-        out = train_from_sims(sims, cfg, groups=groups)
+        out = train_from_sims(
+            sims, cfg, groups=groups, esm_ids=esm_ids, strata=strata,
+            esm_names={i: m for m, i in esm_index.items()},
+        )
         del sims
         if out["best_val"] is not None:
             print(f"[train] best validation loss {out['best_val']:.4f} at step "
@@ -407,12 +504,6 @@ def main() -> None:
           + ("" if ckpt == best_path else "  (NOT the best-validation checkpoint)"))
 
     # ----------------------------------------------------------- emulate
-    print("\n=== loading test scenario " + "=" * 36)
-    test_sims, test_groups = load(TEST_SCENARIOS, args.model, model_path,
-                                  cfg.data.window)
-    verify_layout(test_sims, cfg)
-
-    print("\n=== emulating " + "=" * 48)
     sampler = ScenarioSampler.from_checkpoint(
         ckpt, device=cfg.train.device, use_ema=not args.no_ema
     )
@@ -423,70 +514,92 @@ def main() -> None:
         print(f"[warn] checkpoint was trained with n_tas={n_tas}, n_pr={n_pr}, "
               f"but config.py now says {cfg.data.n_tas}/{cfg.data.n_pr}. "
               f"Using the checkpoint's layout.")
-
-    emulated: List[np.ndarray] = []
-    meta: List[dict] = []
-    t0 = time.time()
-    for i, sim in enumerate(test_sims):
-        gmt = np.asarray(sim[0], dtype=np.float64)
-        T = gmt.size
-        print(f"[emulate] source member {i + 1}/{len(test_sims)} "
-              f"({T} months, {T // 12} years) x {args.members_per_gmt} members",
-              flush=True)
-        ens = sampler.sample(
-            gmt,
-            n_members=args.members_per_gmt,
-            stride=stride,
-            steps=cfg.diffusion.sample_steps,
-            seed=cfg.data.seed * 1000 + i,
+    if sampler.cfg.model.n_esm < len(models):
+        raise SystemExit(
+            f"[fatal] checkpoint was trained with n_esm="
+            f"{sampler.cfg.model.n_esm} but {len(models)} models requested"
         )
-        for m in range(ens.shape[0]):
-            arr = np.empty((1 + n_tas + n_pr, T), dtype=np.float32)
-            arr[0] = gmt                       # keep the GMT row: same layout in
-            arr[1:] = ens[m]                   # and out, so emuvaluate can read it
-            emulated.append(arr)
-            meta.append(dict(
-                index=len(emulated) - 1,
-                scenario=test_groups[i],
-                source_member=i,
-                emulated_member=m,
-                n_months=int(T),
-                seed=cfg.data.seed * 1000 + i,
-            ))
-    print(f"[emulate] {len(emulated)} arrays in {time.time() - t0:.1f}s")
 
-    # ------------------------------------------------------------- save
+    all_meta: List[dict] = []
     tag = "_".join(TEST_SCENARIOS)
-    save_object_list(os.path.join(test_dir, f"{tag}_emulated.npy"), emulated)
-    save_object_list(os.path.join(test_dir, f"{tag}_emulated_tas.npy"),
-                     [a[1 : 1 + n_tas] for a in emulated])
-    save_object_list(os.path.join(test_dir, f"{tag}_emulated_pr.npy"),
-                     [a[1 + n_tas :] for a in emulated])
-    save_object_list(os.path.join(test_dir, f"{tag}_reference.npy"), test_sims)
+    for model in models:
+        print(f"\n=== emulating {model} " + "=" * max(4, 40 - len(model)))
+        test_sims = []
+        for sc in TEST_SCENARIOS:
+            test_sims.extend(load_one(model, sc, args.model_root,
+                                      cfg.data.window,
+                                      args.max_members_per_scenario))
+        if not test_sims:
+            print(f"[warn] {model}: no test simulations, skipping")
+            continue
+        verify_layout(test_sims, cfg, model)
+
+        emulated: List[np.ndarray] = []
+        t0 = time.time()
+        for i, sim in enumerate(test_sims):
+            gmt = np.asarray(sim[0], dtype=np.float64)
+            T = gmt.size
+            print(f"[emulate] {model} source member {i + 1}/{len(test_sims)} "
+                  f"({T} months, {T // 12} years) x {args.members_per_gmt}",
+                  flush=True)
+            seed = cfg.data.seed * 100_000 + esm_index[model] * 1_000 + i
+            ens = sampler.sample(
+                gmt, n_members=args.members_per_gmt, stride=stride,
+                steps=cfg.diffusion.sample_steps, esm_id=esm_index[model],
+                seed=seed,
+            )
+            for m in range(ens.shape[0]):
+                arr = np.empty((1 + n_tas + n_pr, T), dtype=np.float32)
+                arr[0] = gmt          # keep the GMT row: same layout in and out
+                arr[1:] = ens[m]
+                emulated.append(arr)
+                all_meta.append(dict(
+                    model=model, esm_id=esm_index[model],
+                    file=f"{tag}_{model}_emulated.npy",
+                    index=len(emulated) - 1,
+                    scenario=TEST_SCENARIOS[0],
+                    source_member=i, emulated_member=m,
+                    n_months=int(T), seed=seed,
+                ))
+        print(f"[emulate] {model}: {len(emulated)} arrays in {time.time()-t0:.1f}s")
+
+        base = os.path.join(test_dir, f"{tag}_{model}")
+        save_object_list(f"{base}_emulated.npy", emulated)
+        save_object_list(f"{base}_emulated_tas.npy",
+                         [a[1 : 1 + n_tas] for a in emulated])
+        save_object_list(f"{base}_emulated_pr.npy",
+                         [a[1 + n_tas :] for a in emulated])
+        save_object_list(f"{base}_reference.npy", test_sims)
+        del test_sims, emulated
 
     with open(os.path.join(test_dir, "metadata.json"), "w") as f:
         json.dump(dict(
-            model=args.model,
-            model_path=model_path,
+            models=models,
+            esm_ids=esm_index,
+            model_root=args.model_root,
             train_scenarios=list(dict.fromkeys(TRAIN_SCENARIOS)),
             test_scenarios=TEST_SCENARIOS,
             checkpoint=ckpt,
             used_ema=not args.no_ema,
             sample_steps=cfg.diffusion.sample_steps,
+            eta=cfg.diffusion.eta,
             stride=stride,
             overlap=overlap,
             members_per_gmt=args.members_per_gmt,
+            max_members_per_scenario=args.max_members_per_scenario,
             row_layout=dict(gmt=[0, 1], tas=[1, 1 + n_tas],
                             pr=[1 + n_tas, 1 + n_tas + n_pr]),
             units="physical, identical to the load_scenarios output",
-            arrays=meta,
+            normalisation="pooled over all models (not per-ESM)",
+            arrays=all_meta,
             config=sampler.cfg.to_dict(),
         ), f, indent=2)
 
     print(f"\n[done] checkpoint  -> {ckpt}")
+    print(f"[done] esm id map  -> {os.path.join(model_dir, 'esm_ids.json')}")
     print(f"[done] test data   -> {test_dir}")
-    print(f"[done] load with:  sims = list(np.load('{test_dir}/{tag}_emulated.npy', "
-          f"allow_pickle=True))")
+    for model in models:
+        print(f"[done]   {tag}_{model}_emulated.npy")
 
 
 if __name__ == "__main__":

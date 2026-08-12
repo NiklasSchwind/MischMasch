@@ -395,24 +395,51 @@ def group_split(
     groups: Optional[Sequence[Hashable]] = None,
     val_fraction: float = 0.15,
     seed: int = 0,
+    strata: Optional[Sequence[Hashable]] = None,
 ) -> Tuple[List[int], List[int]]:
     """Split *simulations* (never crops) into train/val, respecting groups.
 
-    Pass ``groups`` = one label per simulation (e.g. the scenario name, or the
-    parent run for branched scenarios).  All simulations sharing a label land
-    on the same side of the split, which is what prevents leakage between
-    ensemble members and between scenarios that share a historical prefix.
+    Pass ``groups`` = one label per simulation (e.g. ``"<model>/<scenario>"``).
+    All simulations sharing a label land on the same side of the split, which
+    is what prevents leakage between ensemble members and between scenarios
+    that share a historical prefix.
+
+    Pass ``strata`` = one label per simulation (e.g. the ESM) to hold out
+    ``val_fraction`` of the groups *within each stratum*.  Without it, a random
+    draw can leave one ESM with no validation data at all -- which for
+    multi-ESM training is exactly the model you most wanted to check.
+    Every group must fall inside a single stratum.
     """
     if groups is None:
         groups = list(range(n_sims))
     groups = list(groups)
     assert len(groups) == n_sims
-
-    uniq = sorted(set(groups), key=lambda g: str(g))
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(len(uniq))
-    n_val = max(1, int(round(val_fraction * len(uniq)))) if val_fraction > 0 else 0
-    val_groups = {uniq[j] for j in perm[:n_val]}
+
+    def pick(candidates: List[Hashable]) -> set:
+        if val_fraction <= 0 or not candidates:
+            return set()
+        uniq = sorted(set(candidates), key=str)
+        n_val = max(1, int(round(val_fraction * len(uniq))))
+        perm = rng.permutation(len(uniq))
+        return {uniq[j] for j in perm[:n_val]}
+
+    if strata is None:
+        val_groups = pick(groups)
+    else:
+        strata = list(strata)
+        assert len(strata) == n_sims
+        for s in sorted(set(strata), key=str):
+            in_s = {groups[i] for i in range(n_sims) if strata[i] == s}
+            elsewhere = {groups[i] for i in range(n_sims) if strata[i] != s}
+            if in_s & elsewhere:
+                raise ValueError(
+                    f"group(s) {sorted(map(str, in_s & elsewhere))} appear in more "
+                    f"than one stratum; groups must nest inside strata"
+                )
+        val_groups = set()
+        for s in sorted(set(strata), key=str):
+            val_groups |= pick([groups[i] for i in range(n_sims) if strata[i] == s])
 
     train_idx = [i for i, g in enumerate(groups) if g not in val_groups]
     val_idx = [i for i, g in enumerate(groups) if g in val_groups]

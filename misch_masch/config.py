@@ -127,8 +127,11 @@ class ModelConfig:
     use_elapsed_time_feature: bool = True
 
     cond_dim: int = 512
-    #: hook for later multi-ESM training; leave at 1 for a single model.
-    n_esm: int = 1
+    #: number of ESMs the embedding table covers. MUST equal the number of
+    #: models in the driver script's MODELS list -- the driver checks and
+    #: refuses to start on a mismatch. The embedding is zero-initialised, so
+    #: n_esm = 1 behaves exactly like no ESM conditioning at all.
+    n_esm: int = 5
 
 
 @dataclass
@@ -154,9 +157,11 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.99)
     ema_decay: float = 0.999
     #: The LR cosine runs over exactly max_steps, so shortening the run also
-    #: shortens the schedule. 25k is ~10 minutes at 40 it/s; early stopping
-    #: will usually end it sooner.
-    max_steps: int = 25_000
+    #: shortens the schedule. Raised from 25k for multi-ESM training: five
+    #: models is ~5x the data and five embeddings to fit, so the optimum sits
+    #: much later than the step-18k single-ESM optimum. ~40 min at 40 it/s;
+    #: early stopping will usually end it sooner.
+    max_steps: int = 100_000
     warmup_steps: int = 500
     grad_clip: float = 1.0
     log_every: int = 100
@@ -177,9 +182,11 @@ class TrainConfig:
     #: only artefact is last.pt, and a run that overfits or collapses leaves
     #: nothing usable behind.
     save_best: bool = True
-    #: stop after this many consecutive validations without improvement.
-    #: 0 disables. 12 x val_every = 6000 steps of patience by default.
-    early_stop_patience: int = 12
+    #: stop after this many consecutive validations without a NEW BEST.
+    #: The counter only resets when the best improves, so a single small rise
+    #: costs one tick and is never enough to stop the run on its own.
+    #: 0 disables. 20 x val_every = 10_000 steps of patience by default.
+    early_stop_patience: int = 20
     #: abort if the validation loss exceeds the best seen by this factor --
     #: catches a training collapse instead of grinding on for hours in a worse
     #: basin. 0 disables.
@@ -187,6 +194,10 @@ class TrainConfig:
     #: skip the optimiser step when the gradient norm is not finite, rather
     #: than letting one bad batch move the weights somewhere unrecoverable.
     skip_nonfinite_grads: bool = True
+    #: sample training crops so every ESM is seen equally often. Without this
+    #: whichever model has the most members and scenarios quietly dominates --
+    #: CanESM5 alone has several times the members of some others.
+    balance_esms: bool = True
 
     #: NOTE: classifier-free guidance is deliberately NOT implemented.
     #: CFG shrinks sample diversity, which for an ensemble emulator destroys
@@ -260,6 +271,7 @@ class Config:
             f"qk_norm={m.qk_norm}",
             f"  gmt encoder : d_model={m.gmt_d_model} depth={m.gmt_depth} "
             f"max_years={m.gmt_max_years}",
+            f"  esms        : n_esm={m.n_esm}, balance_esms={t.balance_esms}",
             f"  training    : {t.max_steps} steps, batch {t.batch_size}, lr {t.lr:g}, "
             f"wd={t.weight_decay:g}, dropout={m.dropout:g}, amp={t.amp}",
             f"  validation  : every {t.val_every} steps on {t.val_batches} batches, "

@@ -17,7 +17,7 @@ from typing import Hashable, Optional, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from .config import Config
 from .data import (CropDataset, Normalizer, check_data, collate, group_split,
@@ -60,7 +60,7 @@ def _to_device(batch: dict, device) -> dict:
 
 def save_checkpoint(path, model, ema, normalizer, cfg, step, extra=None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path
+    tmp = path + ".tmp"
     torch.save(
         dict(
             step=step,
@@ -72,38 +72,80 @@ def save_checkpoint(path, model, ema, normalizer, cfg, step, extra=None):
         ),
         tmp,
     )
-    #os.replace(tmp, path)   # atomic: a killed job never leaves a half-written file
+    os.replace(tmp, path)   # atomic: a killed job never leaves a half-written file
 
 
-def make_val_loader(ds_va: CropDataset, cfg: Config) -> DataLoader:
-    """A FIXED random subset spread over every validation simulation.
+def crop_esm_ids(ds: CropDataset) -> np.ndarray:
+    """ESM index of every crop in the dataset."""
+    return np.asarray([ds.esm_ids[local] for local, _ in ds.index], dtype=np.int64)
+
+
+def make_train_sampler(ds_tr: CropDataset, cfg: Config):
+    """Sample crops so every ESM is seen equally often.
+
+    Member counts differ a lot between models (CanESM5 has several times the
+    members of some others), so uniform crop sampling would let one model
+    dominate the shared weights and the others ride on the embedding.
+    """
+    if not cfg.train.balance_esms:
+        return None
+    e = crop_esm_ids(ds_tr)
+    present, counts = np.unique(e, return_counts=True)
+    if present.size < 2:
+        return None
+    per = dict(zip(present.tolist(), counts.tolist()))
+    w = torch.as_tensor([1.0 / per[int(x)] for x in e], dtype=torch.double)
+    return WeightedRandomSampler(w, num_samples=len(ds_tr), replacement=True)
+
+
+def make_val_loaders(ds_va: CropDataset, cfg: Config) -> dict:
+    """One FIXED random subset per ESM, spread over all its validation sims.
+
+    Per-ESM loaders serve two purposes: the reported validation loss becomes
+    the *balanced* mean over models rather than being dominated by whichever
+    model has the most members, and you can see each model's loss separately,
+    which is the diagnostic that tells you whether the ESM embedding is
+    actually doing anything.
 
     Iterating the first N batches in index order instead would only ever see
     the earliest months of the first validation run -- a consistent signal,
     but a very narrow basis for a stopping decision.
     """
-    n = len(ds_va)
-    k = min(n, cfg.train.val_batches * cfg.train.batch_size)
+    e = crop_esm_ids(ds_va)
+    present = sorted(set(e.tolist()))
+    budget = max(1, cfg.train.val_batches // max(len(present), 1))
+    k = budget * cfg.train.batch_size
     rng = np.random.default_rng(cfg.data.seed + 777)
-    idx = rng.permutation(n)[:k].tolist()
-    return DataLoader(
-        Subset(ds_va, idx), batch_size=cfg.train.batch_size, shuffle=False,
-        num_workers=0, collate_fn=collate, drop_last=False,
-    )
+    loaders = {}
+    for esm in present:
+        pool = np.flatnonzero(e == esm)
+        idx = rng.permutation(pool)[: min(k, pool.size)].tolist()
+        loaders[esm] = DataLoader(
+            Subset(ds_va, idx), batch_size=cfg.train.batch_size, shuffle=False,
+            num_workers=0, collate_fn=collate, drop_last=False,
+        )
+    return loaders
 
 
 @torch.no_grad()
-def validate(model, diffusion, loader, device) -> float:
-    """Deterministic: same crops, same diffusion timesteps, every call."""
+def validate(model, diffusion, loaders, device):
+    """Deterministic: same crops, same diffusion timesteps, every call.
+
+    Returns ``(balanced_mean, {esm_id: loss})``.
+    """
     model.eval()
-    tot, n = 0.0, 0
-    g = torch.Generator(device=device).manual_seed(0)
-    for batch in loader:
-        batch = _to_device(batch, device)
-        tot += diffusion.loss(model, batch, generator=g).item()
-        n += 1
+    per = {}
+    for esm, loader in loaders.items():
+        g = torch.Generator(device=device).manual_seed(0)
+        tot, n = 0.0, 0
+        for batch in loader:
+            batch = _to_device(batch, device)
+            tot += diffusion.loss(model, batch, generator=g).item()
+            n += 1
+        per[esm] = tot / max(n, 1)
     model.train()
-    return tot / max(n, 1)
+    mean = float(np.mean(list(per.values()))) if per else float("nan")
+    return mean, per
 
 
 def train_from_sims(
@@ -111,6 +153,8 @@ def train_from_sims(
     cfg: Optional[Config] = None,
     groups: Optional[Sequence[Hashable]] = None,
     esm_ids: Optional[Sequence[int]] = None,
+    strata: Optional[Sequence[Hashable]] = None,
+    esm_names: Optional[dict] = None,
     verbose: bool = True,
 ):
     """Train the diffusion model from a list of ``(1 + n_tas + n_pr, T)`` arrays.
@@ -124,6 +168,10 @@ def train_from_sims(
               ensemble members of the same scenario never straddle the split.
     esm_ids : one integer per simulation if you train on several ESMs; also set
               ``cfg.model.n_esm``.
+    strata  : one label per simulation (normally the ESM) so that
+              ``val_fraction`` of groups is held out *within each* stratum --
+              otherwise a random draw can leave an ESM with no validation data.
+    esm_names : optional {esm_id: name} purely for readable logging.
 
     Returns a dict with ``best_path`` (use this for inference), ``path``
     (``last.pt``), ``best_val`` and ``best_step``.
@@ -140,9 +188,15 @@ def train_from_sims(
     check_data(sims, cfg.data, verbose=verbose)
     normalizer = Normalizer.fit(sims, cfg.data)
 
-    tr_idx, va_idx = group_split(len(sims), groups, cfg.data.val_fraction, cfg.data.seed)
+    tr_idx, va_idx = group_split(len(sims), groups, cfg.data.val_fraction,
+                                 cfg.data.seed, strata=strata)
     if verbose:
         print(f"[split] {len(tr_idx)} train sims / {len(va_idx)} val sims")
+        if strata is not None:
+            for s_ in sorted(set(strata), key=str):
+                nt = sum(1 for i in tr_idx if strata[i] == s_)
+                nv = sum(1 for i in va_idx if strata[i] == s_)
+                print(f"[split]   {str(s_):<20s} {nt:>4d} train / {nv:>3d} val sims")
 
     ds_tr = CropDataset(sims, normalizer, cfg, tr_idx, esm_ids, train=True)
     ds_va = (CropDataset(sims, normalizer, cfg, va_idx, esm_ids, train=False)
@@ -155,13 +209,21 @@ def train_from_sims(
               f"~= sum(T)/window = {n_eff}. Keep the model small if this is "
               f"below ~1e4.")
 
+    sampler = make_train_sampler(ds_tr, cfg)
+    if verbose and sampler is not None:
+        e = crop_esm_ids(ds_tr)
+        pres, cnt = np.unique(e, return_counts=True)
+        shares = ", ".join(
+            f"{(esm_names or {}).get(int(p), p)}: {c} crops" for p, c in zip(pres, cnt))
+        print(f"[data] balancing ESM sampling over {len(pres)} models ({shares})")
     dl_tr = DataLoader(
-        ds_tr, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True,
+        ds_tr, batch_size=cfg.train.batch_size,
+        shuffle=(sampler is None), sampler=sampler, drop_last=True,
         num_workers=cfg.train.num_workers, collate_fn=collate,
         pin_memory=(device.type == "cuda"),
         persistent_workers=cfg.train.num_workers > 0,
     )
-    dl_va = make_val_loader(ds_va, cfg) if ds_va else None
+    dl_va = make_val_loaders(ds_va, cfg) if ds_va else None
 
     model = build_model(cfg, n_gmt_features(cfg)).to(device)
     if verbose:
@@ -224,7 +286,7 @@ def train_from_sims(
                 running, gnorms, t0 = [], [], time.time()
 
             if dl_va is not None and step % cfg.train.val_every == 0:
-                vl = validate(model, diffusion, dl_va, device)
+                vl, per_esm = validate(model, diffusion, dl_va, device)
                 improved = vl < best_val - 1e-5
                 if improved:
                     best_val, best_step, n_since_best = vl, step, 0
@@ -234,10 +296,15 @@ def train_from_sims(
                 else:
                     n_since_best += 1
                 if verbose:
+                    detail = ""
+                    if len(per_esm) > 1:
+                        detail = "  [" + " ".join(
+                            f"{(esm_names or {}).get(k, k)}={v:.3f}"
+                            for k, v in sorted(per_esm.items())) + "]"
                     print(f"step {step:>7d}  VAL loss {vl:.4f}   "
                           f"best {best_val:.4f} @ {best_step}"
-                          + ("  *" if improved else f"  ({n_since_best} since best)"),
-                          flush=True)
+                          + ("  *" if improved else f"  ({n_since_best} since best)")
+                          + detail, flush=True)
 
                 if cfg.train.spike_abort_ratio and vl > best_val * cfg.train.spike_abort_ratio:
                     stop_reason = (
@@ -248,7 +315,7 @@ def train_from_sims(
                 elif (cfg.train.early_stop_patience
                       and n_since_best >= cfg.train.early_stop_patience):
                     stop_reason = (
-                        f"no improvement for {n_since_best} validations "
+                        f"no new best for {n_since_best} consecutive validations "
                         f"({n_since_best * cfg.train.val_every} steps); best "
                         f"{best_val:.4f} @ step {best_step}"
                     )
