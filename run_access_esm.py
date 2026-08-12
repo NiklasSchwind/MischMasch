@@ -55,7 +55,7 @@ TRAIN_SCENARIOS = [
     "flat10-from-025",
     "flat10-zec-from-025",
     "flat10-cdr-from-025",
-    "ssp126",
+    "ssp245",
     "esm-1pct-brch-1000pgc-from-025",
     "esm-1pct-brch-750PgC",
     "esm-1pct-brch-2000PgC",
@@ -65,7 +65,7 @@ TRAIN_SCENARIOS = [
     "ssp460",
     "1pctco2",
 ]
-TEST_SCENARIOS = ["ssp245"]
+TEST_SCENARIOS = ["ssp126"]
 
 # NOTE: the row layout (n_tas / n_pr) is NOT defined here -- it comes from
 # misch_masch/config.py, so there is exactly one place to change it.
