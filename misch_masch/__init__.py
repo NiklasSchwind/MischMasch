@@ -17,6 +17,7 @@ Quick start
 from .config import Config, DataConfig, DiffusionConfig, ModelConfig, TrainConfig
 from .data import CropDataset, Normalizer, check_data, group_split
 from .diffusion import Diffusion
+from .inference import load_gmt, run_inference
 from .model import MischMaschDiT, build_model
 from .sample import ScenarioSampler
 from .train import train_from_sims
@@ -26,4 +27,5 @@ __all__ = [
     "Normalizer", "CropDataset", "check_data", "group_split",
     "Diffusion", "MischMaschDiT", "build_model",
     "train_from_sims", "ScenarioSampler",
+    "load_gmt", "run_inference",
 ]

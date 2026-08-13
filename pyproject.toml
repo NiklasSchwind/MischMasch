@@ -14,7 +14,7 @@ dependencies = [
 
 [project.scripts]
 misch-masch-train = "run_access_esm:main"
-misch-masch-infer = "inference:main"
+misch-masch-infer = "misch_masch.inference:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
