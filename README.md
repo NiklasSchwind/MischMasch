@@ -269,6 +269,24 @@ month, with the full 116-vector as the token's channel dimension. Cross-region
 structure comes from the embedding matrix and the residual stream (no false
 locality), cross-time structure from full self-attention over the window's month tokens.
 
+### Optional GMT-history truncation
+
+`data.p_full_gmt_history` (default `1.0`, i.e. off) is a training augmentation.
+With probability `p` the encoder sees the GMT record from the first year of the
+scenario, as before; with probability `1 - p` the record instead starts at a
+year drawn uniformly between the scenario start and the first year of the crop,
+and is presented *as if it began there* — relative positions, and the path
+features (cumulative integral, peak, overshoot depth, elapsed time) all computed
+over the truncated record only. The **end** of the record never moves.
+
+This trains the model to emulate a scenario for which you hold only part of the
+preceding GMT record — at inference you simply pass the shorter GMT array you
+have, and no other change is needed. The cost is real: the cumulative-warming
+integral is what carries path dependence, so a model trained with heavy
+truncation has systematically less of it to work with. Treat it as a robustness
+trade-off, not a free win, and compare against `p = 1.0` on overshoot scenarios
+specifically.
+
 ### GMT is annual
 
 Row 0 is constant within each calendar year, so it is encoded at annual

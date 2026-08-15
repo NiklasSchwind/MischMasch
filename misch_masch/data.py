@@ -325,6 +325,23 @@ class CropDataset(Dataset):
             return 0
         return int(rng.choice(self._ctx_choices))
 
+    def _sample_history_start(self, rng: np.random.Generator, x: int,
+                              end_year: int) -> int:
+        """First year of the GMT record shown to the encoder.
+
+        0 = the whole scenario (the default).  Otherwise a year drawn uniformly
+        between the first year of the scenario and the first year of the crop;
+        the record is then presented as if it began there.  The END is never
+        moved -- the history always reaches ``end_year``.
+        """
+        p = self.cfg.data.p_full_gmt_history
+        if p >= 1.0 or rng.random() < p:
+            return 0
+        latest = min(x // 12, end_year)          # first year the crop touches
+        if latest <= 0:
+            return 0
+        return int(rng.integers(0, latest + 1))
+
     def __getitem__(self, i: int):
         local, x = self.index[i]
         W = self.window
@@ -336,12 +353,11 @@ class CropDataset(Dataset):
 
         if self.train:
             rng = np.random.default_rng()
-            L = self._sample_ctx_len(rng)
         else:
             # deterministic for reproducible validation loss
             rng = np.random.default_rng(i + 12345)
-            L = self._sample_ctx_len(rng)
-        L = min(L, W - 12)
+        L = min(self._sample_ctx_len(rng), W - 12)
+        y0 = self._sample_history_start(rng, x, end_year)
 
         ctx = np.zeros_like(y)
         ctx_mask = np.zeros(W, dtype=np.float32)
@@ -350,8 +366,15 @@ class CropDataset(Dataset):
             ctx_mask[:L] = 1.0
 
         month_idx = ((np.arange(x, x + W) + d.start_month) % 12).astype(np.int64)
+
+        # Trailing years are dropped as well as leading ones: the encoder is
+        # causal, so years after end_year can never influence the readout, and
+        # slicing them off only reduces padding.  With y0 = 0 this is exactly
+        # the untruncated behaviour.
+        gmt_hist = np.ascontiguousarray(gmt[y0 : end_year + 1])
+        end_local = end_year - y0
         feats = gmt_path_features(
-            gmt, end_year, self.cfg.model.use_elapsed_time_feature
+            gmt_hist, end_local, self.cfg.model.use_elapsed_time_feature
         )
 
         return dict(
@@ -359,8 +382,8 @@ class CropDataset(Dataset):
             ctx=torch.from_numpy(ctx),
             ctx_mask=torch.from_numpy(ctx_mask),
             month_idx=torch.from_numpy(month_idx),
-            gmt=torch.from_numpy(gmt),
-            end_year=torch.tensor(end_year, dtype=torch.long),
+            gmt=torch.from_numpy(gmt_hist),
+            end_year=torch.tensor(end_local, dtype=torch.long),
             gmt_feats=torch.from_numpy(feats),
             esm_id=torch.tensor(self.esm_ids[local], dtype=torch.long),
         )

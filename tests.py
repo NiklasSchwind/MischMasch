@@ -144,6 +144,49 @@ def test_january_alignment():
     print(f"  crop alignment OK ({len(ds)} Jan-only vs {len(ds2)} any-month crops)")
 
 
+def test_gmt_history_truncation():
+    """p_full_gmt_history controls where the GMT record shown to the encoder
+    begins. The END must never move, and p = 1.0 must be a no-op."""
+    sims = [make_sim(40)]                       # 480 months = 40 years
+    nrm = Normalizer.fit(sims, tiny_cfg().data)
+    gmt_full = nrm.transform_gmt(nrm.annual_gmt(sims[0]))
+
+    def probe(p, n=200):
+        cfg = tiny_cfg(**{"data.p_full_gmt_history": p, "data.window": 120})
+        ds = CropDataset(sims, nrm, cfg, train=True)
+        i = len(ds) - 1                          # a crop late in the record
+        _local, x = ds.index[i]
+        abs_end = (x + cfg.data.window) // 12 - 1
+        lens, ends = [], []
+        for _ in range(n):
+            b = ds[i]
+            g = b["gmt"].numpy()
+            e = int(b["end_year"])
+            # the history must end exactly at the crop's last year, always
+            assert abs(g[e] - gmt_full[abs_end]) < 1e-6, "history end moved"
+            assert e == g.size - 1, "readout is not the last supplied year"
+            # feats[0] is the current GMT level -- invariant to truncation
+            assert abs(float(b["gmt_feats"][0]) - gmt_full[abs_end]) < 1e-5
+            lens.append(g.size); ends.append(e)
+        return abs_end, sorted(set(lens))
+
+    abs_end, lens1 = probe(1.0)
+    assert lens1 == [abs_end + 1], lens1          # always the whole record
+    abs_end0, lens0 = probe(0.0)
+    assert len(lens0) > 3, lens0                  # varied start years
+    assert max(lens0) == abs_end0 + 1             # can still be the full record
+    assert min(lens0) < abs_end0 + 1              # and is often shorter
+
+    # validation mode must be deterministic
+    cfg = tiny_cfg(**{"data.p_full_gmt_history": 0.5, "data.window": 120})
+    dsv = CropDataset(sims, nrm, cfg, train=False)
+    a = [int(dsv[i]["gmt"].numel()) for i in range(20)]
+    b = [int(dsv[i]["gmt"].numel()) for i in range(20)]
+    assert a == b, "validation GMT truncation is not reproducible"
+    print(f"  gmt history truncation OK (p=1 -> len {lens1[0]}; "
+          f"p=0 -> {len(lens0)} distinct lengths {min(lens0)}..{max(lens0)})")
+
+
 def test_causal_gmt_encoder():
     """The readout at end_year must not depend on any later year."""
     cfg = tiny_cfg()

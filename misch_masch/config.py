@@ -28,7 +28,7 @@ class DataConfig:
     start_month: int = 0
 
     # ---- cropping ----
-    window: int = 480  # months per generated piece (must be a multiple of 12)
+    window: int = 240  # months per generated piece (must be a multiple of 12)
     #: if True, crops start at X with X % 12 == 0 (i.e. always January).
     #: False gives 12x the crops as seasonal-phase augmentation; the model
     #: carries a per-token calendar-month embedding either way.
@@ -51,6 +51,24 @@ class DataConfig:
     #: window of a scenario, which has no history to condition on).
     p_no_context: float = 0.20
 
+    # ---- GSAT/GMT history truncation (augmentation) ----
+    #: probability that the GMT history handed to the encoder starts at the
+    #: FIRST year of the scenario. With probability 1 - p_full_gmt_history the
+    #: history instead starts at a year drawn uniformly between the first year
+    #: of the scenario and the first year of the crop, and is presented to the
+    #: encoder as if the record began there (relative positions, and the path
+    #: features -- cumulative integral, peak, overshoot depth, elapsed time --
+    #: all computed over the truncated record only).
+    #:
+    #: 1.0 reproduces the previous behaviour exactly. Lower values train the
+    #: model to emulate a scenario for which you only hold part of the
+    #: preceding GMT record, at the cost of weakening its access to the full
+    #: cumulative-warming signal that carries path dependence -- so treat it as
+    #: a robustness/path-dependence trade-off, not a free win.
+    #: The END of the history is never moved: it always reaches the last year
+    #: covered by the crop.
+    p_full_gmt_history: float = 1.0
+
     # ---- splitting ----
     val_fraction: float = 0.15
     seed: int = 0
@@ -71,6 +89,11 @@ class DataConfig:
             )
         if not 0.0 <= self.p_no_context <= 1.0:
             raise ValueError(f"data.p_no_context must be in [0, 1], got {self.p_no_context}")
+        if not 0.0 <= self.p_full_gmt_history <= 1.0:
+            raise ValueError(
+                f"data.p_full_gmt_history must be in [0, 1], "
+                f"got {self.p_full_gmt_history}"
+            )
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError(f"data.val_fraction must be in [0, 1), got {self.val_fraction}")
 
@@ -105,7 +128,7 @@ class ModelConfig:
     n_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.1
-    max_window: int = 512  # capacity of the learned positional table
+    max_window: int = 256  # capacity of the learned positional table
     #: normalise q and k to unit RMS before the attention dot product. This
     #: bounds the logits at ~sqrt(head_dim) however large the projections grow,
     #: which prevents attention entropy collapse -- the failure that ended the
@@ -267,6 +290,9 @@ class Config:
             f"  context     : {cl[0]}..{cl[-1]} step 12 ({len(cl)} lengths), "
             f"p_no_context={d.p_no_context}",
             f"  pr transform: {d.pr_transform}",
+            f"  gmt history : full from year 0 with p={d.p_full_gmt_history:g}"
+            + ("" if d.p_full_gmt_history >= 1.0
+               else ", otherwise truncated to a random start year"),
             f"  denoiser    : d_model={m.d_model} depth={m.depth} heads={m.n_heads} "
             f"qk_norm={m.qk_norm}",
             f"  gmt encoder : d_model={m.gmt_d_model} depth={m.gmt_depth} "

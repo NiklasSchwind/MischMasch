@@ -270,6 +270,7 @@ def build_config(args) -> Config:
     setopt(cfg.data, "window", args.window)
     setopt(cfg.data, "january_start", args.january_start)
     setopt(cfg.data, "val_fraction", args.val_fraction)
+    setopt(cfg.data, "p_full_gmt_history", args.p_full_gmt_history)
     setopt(cfg.data, "seed", args.seed)
     if window_overridden:
         # an explicit --window invalidates any hand-written context ladder;
@@ -381,6 +382,10 @@ def main() -> None:
     g.add_argument("--spike-abort-ratio", type=float, default=None,
                    help=f"abort if val exceeds best by this factor, 0 disables "
                         f"(config: {_t.spike_abort_ratio:g})")
+    g.add_argument("--p-full-gmt-history", type=float, default=None,
+                   help=f"probability the GMT history starts at year 0; "
+                        f"otherwise it starts at a random year before the crop "
+                        f"(config: {_d.p_full_gmt_history:g})")
     g.add_argument("--val-fraction", type=float, default=None,
                    help=f"fraction of each model's scenarios held out "
                         f"(config: {_d.val_fraction})")
@@ -469,9 +474,6 @@ def main() -> None:
 
     with open(os.path.join(model_dir, "esm_ids.json"), "w") as f:
         json.dump(esm_index, f, indent=2)
-
-    with open(os.path.join(model_dir, "configs.txt"), "w") as f:
-        f.write(cfg.summary())
 
     # ---------------------------------------------------------------- train
     if not args.skip_train:
